@@ -112,6 +112,38 @@ class PullRequest:
                 return show
         return None
 
+    def get_pr_ttl_hours(self) -> Optional[int]:
+        """Get PR-level TTL override from labels.
+
+        Looks for reusable PR-level TTL labels like "🎪 ⌛ 1w".
+        Returns None if no TTL override is set or if TTL is "close".
+
+        Returns:
+            Number of hours, or None if no override / "close" TTL
+        """
+        from .date_utils import ttl_to_hours
+
+        for label in self.labels:
+            # Match PR-level TTL labels: "🎪 ⌛ {ttl}"
+            if label.startswith("🎪 ⌛ "):
+                ttl_value = label.replace("🎪 ⌛ ", "").strip()
+                return ttl_to_hours(ttl_value)
+
+        return None
+
+    def _get_effective_ttl_display(self) -> str:
+        """Get effective TTL for display purposes.
+
+        Returns the PR-level TTL label value if set, otherwise the default.
+        """
+        from .constants import DEFAULT_TTL
+
+        for label in self.labels:
+            if label.startswith("🎪 ⌛ "):
+                return label.replace("🎪 ⌛ ", "").strip()
+
+        return DEFAULT_TTL
+
     def _parse_shows_from_labels(self) -> List[Show]:
         """Parse all shows from circus tent labels"""
         # Find all unique SHAs from circus labels
@@ -626,13 +658,16 @@ class PullRequest:
         if not self.current_show:
             return {"status": "no_environment", "show": None}
 
+        # Get effective TTL: PR-level label > show default
+        effective_ttl = self._get_effective_ttl_display()
+
         return {
             "status": "active",
             "show": {
                 "sha": self.current_show.sha,
                 "status": self.current_show.status,
                 "ip": self.current_show.ip,
-                "ttl": self.current_show.ttl,
+                "ttl": effective_ttl,
                 "requested_by": self.current_show.requested_by,
                 "created_at": self.current_show.created_at,
                 "aws_service_name": self.current_show.aws_service_name,
@@ -666,6 +701,9 @@ class PullRequest:
                     show_type = "building"
                 # No pointer = orphaned
 
+                # Get effective TTL from PR-level label
+                effective_ttl = pr._get_effective_ttl_display()
+
                 environment_data = {
                     "pr_number": pr_number,
                     "status": "active",  # Keep for compatibility
@@ -673,7 +711,7 @@ class PullRequest:
                         "sha": show.sha,
                         "status": show.status,
                         "ip": show.ip,
-                        "ttl": show.ttl,
+                        "ttl": effective_ttl,
                         "requested_by": show.requested_by,
                         "created_at": show.created_at,
                         "age": show.age_display(),  # Add age display
@@ -843,11 +881,25 @@ class PullRequest:
                     print(f"  ❌ Failed to add {label}: {e}")
                     raise
 
+            # Auto-create PR-level TTL label if not present
+            self._ensure_ttl_label()
+
         return True
+
+    def _ensure_ttl_label(self) -> None:
+        """Ensure PR has a TTL label, adding the default if not present."""
+        from .constants import DEFAULT_TTL
+
+        # Check if any PR-level TTL label already exists
+        has_ttl_label = any(label.startswith("🎪 ⌛ ") for label in self.labels)
+
+        if not has_ttl_label:
+            default_ttl_label = f"🎪 ⌛ {DEFAULT_TTL}"
+            print(f"🏷️ Auto-creating TTL label: {default_ttl_label}")
+            self.add_label(default_ttl_label)
 
     def _create_new_show(self, target_sha: str) -> Show:
         """Create a new Show object for the target SHA"""
-        from .constants import DEFAULT_TTL
         from .date_utils import format_utc_now
 
         return Show(
@@ -855,7 +907,6 @@ class PullRequest:
             sha=short_sha(target_sha),
             status="building",
             created_at=format_utc_now(),
-            ttl=DEFAULT_TTL,
             requested_by=GitHubInterface.get_current_actor(),
         )
 
@@ -872,7 +923,8 @@ class PullRequest:
         from .github_messages import success_comment
 
         if not dry_run:
-            comment = success_comment(show)
+            effective_ttl = self._get_effective_ttl_display()
+            comment = success_comment(show, ttl=effective_ttl)
             get_github().post_comment(self.pr_number, comment)
 
     def _post_rolling_start_comment(

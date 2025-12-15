@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
-from .constants import DEFAULT_TTL
-
 
 # Import interfaces for singleton access
 # Note: These will be imported when the module loads, creating singletons
@@ -30,8 +28,8 @@ class Show:
     status: str  # building, built, deploying, running, updating, failed
     ip: Optional[str] = None  # Environment IP address
     created_at: Optional[str] = None  # ISO timestamp
-    ttl: str = DEFAULT_TTL  # 24h, 48h, close, etc.
     requested_by: Optional[str] = None  # GitHub username
+    # Note: TTL is now managed at PR-level, not per-Show. See PullRequest.get_pr_ttl_hours()
 
     @property
     def aws_service_name(self) -> str:
@@ -118,7 +116,8 @@ class Show:
         labels = [
             f"{CIRCUS_PREFIX} {self.sha} {MEANING_TO_EMOJI['status']} {self.status}",  # SHA-first status
             f"{CIRCUS_PREFIX} {self.sha} {MEANING_TO_EMOJI['created_at']} {self.created_at}",  # SHA-first timestamp
-            f"{CIRCUS_PREFIX} {self.sha} {MEANING_TO_EMOJI['ttl']} {self.ttl}",  # SHA-first TTL
+            # Note: TTL is now managed at PR-level with reusable labels like "🎪 ⌛ 1w"
+            # instead of per-SHA labels. See PullRequest.get_pr_ttl_hours()
         ]
 
         if self.ip:
@@ -282,8 +281,7 @@ class Show:
                     show_data["created_at"] = value
                 elif emoji == "🌐":  # IP with port
                     show_data["ip"] = value.replace(":8080", "")  # Remove port for storage
-                elif emoji == "⌛":  # TTL
-                    show_data["ttl"] = value
+                # Note: TTL (⌛) labels are now PR-level, not per-SHA. Ignored here.
                 elif emoji == "🤡":  # User (clown!)
                     show_data["requested_by"] = value
 

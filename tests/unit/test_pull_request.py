@@ -221,8 +221,6 @@ def test_pullrequest_get_status() -> None:
 
 def test_pullrequest_create_new_show() -> None:
     """Test new show creation"""
-    from showtime.core.constants import DEFAULT_TTL
-
     pr = PullRequest(1234, [])
 
     # Mock format_utc_now for consistent testing
@@ -235,8 +233,8 @@ def test_pullrequest_create_new_show() -> None:
         assert show.sha == "abc123f"  # Shortened
         assert show.status == "building"
         assert show.created_at == "2024-01-15T14-30"
-        assert show.ttl == DEFAULT_TTL
         assert show.requested_by == "unknown"  # Default when no actor set
+        # Note: TTL is now PR-level, not per-Show
 
 
 @patch("showtime.core.pull_request.get_github")

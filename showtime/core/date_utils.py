@@ -78,3 +78,46 @@ def is_expired(created_at: str, max_age_hours: int) -> bool:
 
     expiry_time = created_dt + timedelta(hours=max_age_hours)
     return datetime.utcnow() > expiry_time
+
+
+def ttl_to_hours(ttl: str) -> Optional[int]:
+    """Convert a TTL string to hours.
+
+    Supports formats:
+        - "24h", "48h", "72h" - hours
+        - "1d", "2d", "7d" - days
+        - "1w" - weeks
+        - "close" - returns None (never expires automatically, only on PR close)
+
+    Args:
+        ttl: TTL string like "48h", "1w", "close"
+
+    Returns:
+        Number of hours, or None if TTL means "never expire" (e.g., "close")
+    """
+    if not ttl:
+        return None
+
+    ttl = ttl.strip().lower()
+
+    # "close" means expire only when PR closes, not time-based
+    if ttl == "close":
+        return None
+
+    import re
+
+    match = re.match(r"^(\d+)([hdw])$", ttl)
+    if not match:
+        return None
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == "h":
+        return value
+    elif unit == "d":
+        return value * 24
+    elif unit == "w":
+        return value * 24 * 7
+
+    return None

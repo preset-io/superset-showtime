@@ -688,19 +688,39 @@ def cleanup(
 ) -> None:
     """🎪 Clean up orphaned or expired environments and labels"""
     try:
-        # Parse older_than to hours
+        # Parse older_than to hours (used as default/fallback)
         import re
 
-        time_match = re.match(r"(\d+)([hd])", older_than)
+        time_match = re.match(r"(\d+)([hdw])", older_than)
         if not time_match:
             p(f"❌ Invalid time format: {older_than}")
             return
 
-        max_age_hours = int(time_match.group(1))
-        if time_match.group(2) == "d":
-            max_age_hours *= 24
+        default_max_age_hours = int(time_match.group(1))
+        unit = time_match.group(2)
+        if unit == "d":
+            default_max_age_hours *= 24
+        elif unit == "w":
+            default_max_age_hours *= 24 * 7
 
-        p(f"🎪 [bold blue]Cleaning environments older than {max_age_hours}h...[/bold blue]")
+        # Parse max_age cap (only used with --respect-ttl)
+        max_age_cap_hours: Optional[int] = None
+        if max_age and respect_ttl:
+            cap_match = re.match(r"(\d+)([hdw])", max_age)
+            if cap_match:
+                max_age_cap_hours = int(cap_match.group(1))
+                cap_unit = cap_match.group(2)
+                if cap_unit == "d":
+                    max_age_cap_hours *= 24
+                elif cap_unit == "w":
+                    max_age_cap_hours *= 24 * 7
+
+        if respect_ttl:
+            p("🎪 [bold blue]Cleaning environments respecting individual TTL labels...[/bold blue]")
+            if max_age_cap_hours:
+                p(f"   (with max age cap of {max_age_cap_hours}h)")
+        else:
+            p(f"🎪 [bold blue]Cleaning environments older than {default_max_age_hours}h...[/bold blue]")
 
         # Get all PRs with environments
         pr_numbers = PullRequest.find_all_with_environments()
@@ -710,22 +730,44 @@ def cleanup(
 
         cleaned_count = 0
         orphan_cleaned_count = 0
+        skipped_ttl_count = 0
 
         for pr_number in pr_numbers:
             pr = PullRequest.from_id(pr_number)
 
+            # Determine effective TTL for this PR
+            if respect_ttl:
+                pr_ttl_hours = pr.get_pr_ttl_hours()
+                if pr_ttl_hours is None:
+                    # TTL is "close" or not set - skip time-based cleanup
+                    if any(label.startswith("🎪 ⌛ ") for label in pr.labels):
+                        # Has explicit "close" TTL - never expire by time
+                        skipped_ttl_count += 1
+                        continue
+                    # No TTL label - use default
+                    effective_max_age = default_max_age_hours
+                else:
+                    effective_max_age = pr_ttl_hours
+                    # Apply cap if specified
+                    if max_age_cap_hours and effective_max_age > max_age_cap_hours:
+                        effective_max_age = max_age_cap_hours
+            else:
+                effective_max_age = default_max_age_hours
+
             # Clean expired environments with pointers
-            if pr.stop_if_expired(max_age_hours, dry_run):
+            if pr.stop_if_expired(effective_max_age, dry_run):
                 cleaned_count += 1
 
             # Clean orphaned environments without pointers
-            orphan_cleaned_count += pr.cleanup_orphaned_shows(max_age_hours, dry_run)
+            orphan_cleaned_count += pr.cleanup_orphaned_shows(effective_max_age, dry_run)
 
-        if cleaned_count > 0 or orphan_cleaned_count > 0:
+        if cleaned_count > 0 or orphan_cleaned_count > 0 or skipped_ttl_count > 0:
             if cleaned_count > 0:
                 p(f"🎪 ✅ Cleaned up {cleaned_count} expired environments")
             if orphan_cleaned_count > 0:
                 p(f"🎪 ✅ Cleaned up {orphan_cleaned_count} orphaned environments")
+            if skipped_ttl_count > 0:
+                p(f"🎪 ⏭️ Skipped {skipped_ttl_count} environments with 'close' TTL")
         else:
             p("🎪 No expired environments found")
 
