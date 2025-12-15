@@ -739,13 +739,23 @@ def cleanup(
             if respect_ttl:
                 pr_ttl_hours = pr.get_pr_ttl_hours()
                 if pr_ttl_hours is None:
-                    # TTL is "close" or not set - skip time-based cleanup
-                    if any(label.startswith("🎪 ⌛ ") for label in pr.labels):
-                        # Has explicit "close" TTL - never expire by time
-                        skipped_ttl_count += 1
-                        continue
-                    # No TTL label - use default
-                    effective_max_age = default_max_age_hours
+                    # Check if there's an explicit TTL label
+                    ttl_label = next(
+                        (label for label in pr.labels if label.startswith("🎪 ⌛ ")), None
+                    )
+                    if ttl_label:
+                        ttl_value = ttl_label.replace("🎪 ⌛ ", "").strip().lower()
+                        if ttl_value == "close":
+                            # Explicit "close" TTL - never expire by time
+                            skipped_ttl_count += 1
+                            continue
+                        else:
+                            # Invalid/unparsable TTL label - warn and use default
+                            p(f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h")
+                            effective_max_age = default_max_age_hours
+                    else:
+                        # No TTL label - use default
+                        effective_max_age = default_max_age_hours
                 else:
                     effective_max_age = pr_ttl_hours
                     # Apply cap if specified

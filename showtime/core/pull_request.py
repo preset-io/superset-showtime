@@ -945,7 +945,8 @@ class PullRequest:
         from .github_messages import rolling_success_comment
 
         if not dry_run:
-            comment = rolling_success_comment(old_show, new_show)
+            effective_ttl = self._get_effective_ttl_display()
+            comment = rolling_success_comment(old_show, new_show, ttl=effective_ttl)
             get_github().post_comment(self.pr_number, comment)
 
     def _post_cleanup_comment(self, show: Show, dry_run: bool = False) -> None:
