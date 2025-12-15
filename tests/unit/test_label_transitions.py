@@ -184,7 +184,7 @@ def test_status_replacement_preserves_other_labels(mock_get_github: Any) -> None
             "🎪 abc123f 🚦 building",  # Status - should be replaced
             "🎪 🎯 abc123f",  # Pointer - should stay
             "🎪 abc123f 📅 2024-01-15T14-30",  # Timestamp - should stay
-            "🎪 abc123f ⌛ 24h",  # TTL - should stay
+            "🎪 ⌛ 24h",  # PR-level TTL - should stay
             "🎪 abc123f 🤡 maxime",  # User - should stay
             "bug",  # Non-circus - should stay
             "enhancement",  # Non-circus - should stay
@@ -197,7 +197,6 @@ def test_status_replacement_preserves_other_labels(mock_get_github: Any) -> None
         sha="abc123f",
         status="failed",  # Status changed
         created_at="2024-01-15T14-30",
-        ttl="24h",
         requested_by="maxime",
     )
 

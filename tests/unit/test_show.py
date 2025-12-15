@@ -1,11 +1,12 @@
 """
 Tests for Show class - Individual environment management
+
+Note: TTL is now managed at PR-level, not per-Show. See test_ttl.py for TTL tests.
 """
 
 from datetime import datetime
 from unittest.mock import patch
 
-from showtime.core.constants import DEFAULT_TTL
 from showtime.core.show import Show, short_sha
 
 
@@ -16,7 +17,6 @@ def test_show_creation() -> None:
         sha="abc123f",
         status="running",
         ip="52.1.2.3",
-        ttl=DEFAULT_TTL,
         requested_by="maxime",
     )
 
@@ -24,7 +24,6 @@ def test_show_creation() -> None:
     assert show.sha == "abc123f"
     assert show.status == "running"
     assert show.ip == "52.1.2.3"
-    assert show.ttl == DEFAULT_TTL
     assert show.requested_by == "maxime"
 
 
@@ -108,7 +107,6 @@ def test_show_from_circus_labels() -> None:
         "🎪 🎯 abc123f",  # Active pointer
         "🎪 abc123f 📅 2024-01-15T14-30",
         "🎪 abc123f 🌐 52.1.2.3:8080",  # IP with port
-        f"🎪 abc123f ⌛ {DEFAULT_TTL}",
         "🎪 abc123f 🤡 maxime",
         "some-other-label",  # Should be ignored
     ]
@@ -121,8 +119,8 @@ def test_show_from_circus_labels() -> None:
     assert show.status == "running"
     assert show.ip == "52.1.2.3"  # Port removed during parsing
     assert show.created_at == "2024-01-15T14-30"
-    assert show.ttl == DEFAULT_TTL
     assert show.requested_by == "maxime"
+    # Note: TTL is now PR-level, not per-Show
 
 
 def test_show_from_circus_labels_missing_pointer() -> None:
@@ -163,7 +161,6 @@ def test_show_to_circus_labels() -> None:
         status="running",
         ip="52.1.2.3",
         created_at="2024-01-15T14-30",
-        ttl=DEFAULT_TTL,
         requested_by="maxime",
     )
 
@@ -173,7 +170,7 @@ def test_show_to_circus_labels() -> None:
         "🎪 abc123f 🚦 running",
         # Note: Pointer labels (🎯) are now managed separately, not by Show
         "🎪 abc123f 📅 2024-01-15T14-30",
-        f"🎪 abc123f ⌛ {DEFAULT_TTL}",
+        # Note: TTL labels are now PR-level, not per-Show
         "🎪 abc123f 🌐 52.1.2.3:8080",  # IP with port added
         "🎪 abc123f 🤡 maxime",
     ]
@@ -189,11 +186,11 @@ def test_show_to_circus_labels_minimal() -> None:
 
     labels = show.to_circus_labels()
 
-    # Should have status, timestamp, TTL (created_at auto-generated)
+    # Should have status and timestamp (created_at auto-generated)
     assert any("🚦 building" in label for label in labels)
     # Note: Pointer labels (🎯) are now managed separately
     assert any("📅" in label for label in labels)  # Auto-generated timestamp
-    assert any(f"⌛ {DEFAULT_TTL}" in label for label in labels)  # Default TTL
+    # Note: TTL labels are now PR-level, not per-Show
 
     # Should not have IP or user labels
     assert not any("🌐" in label for label in labels)
@@ -235,7 +232,7 @@ def test_show_from_circus_labels_partial() -> None:
     assert show.ip is None
     assert show.created_at is None
     assert show.requested_by is None
-    assert show.ttl == DEFAULT_TTL
+    # Note: TTL is now PR-level, not per-Show
 
 
 def test_show_is_expired_datetime_import() -> None:
@@ -304,15 +301,15 @@ def test_show_to_circus_labels_no_active_pointer() -> None:
 
     labels = show.to_circus_labels()
 
-    # Should include status, timestamp, TTL, IP, requester
+    # Should include status, timestamp, IP, requester (but NOT TTL - that's PR-level now)
     assert any("🎪 abc123f 🚦 running" in label for label in labels)
     assert any("🎪 abc123f 📅" in label for label in labels)
-    assert any(f"🎪 abc123f ⌛ {DEFAULT_TTL}" in label for label in labels)
     assert any("🎪 abc123f 🌐 1.2.3.4:8080" in label for label in labels)
     assert any("🎪 abc123f 🤡 testuser" in label for label in labels)
 
-    # Should NOT include active pointer
+    # Should NOT include active pointer or TTL (TTL is PR-level now)
     assert not any("🎪 🎯" in label for label in labels)
+    assert not any("⌛" in label for label in labels)
 
 
 def test_show_to_circus_labels_building_status() -> None:

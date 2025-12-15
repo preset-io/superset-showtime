@@ -111,19 +111,23 @@ def start_comment(show: Show) -> str:
     return f"🎪 {links['showtime_link']} is building environment on {links['gha_link']} for {links['commit_link']}"
 
 
-def success_comment(show: Show, feature_count: Optional[int] = None) -> str:
+def success_comment(
+    show: Show, feature_count: Optional[int] = None, ttl: Optional[str] = None
+) -> str:
     """Environment success comment
 
     Args:
-        show: Show object with SHA, IP, TTL, etc.
+        show: Show object with SHA, IP, etc.
         feature_count: Number of enabled feature flags (optional)
+        ttl: Override TTL display (PR-level TTL takes precedence)
     """
     links = _create_header_links(show.sha)
     header = f"🎪 {links['showtime_link']} deployed environment on {links['gha_link']} for {links['commit_link']}"
 
+    effective_ttl = ttl or show.ttl
     bullets = [
         f"**Environment:** http://{show.ip}:8080 (admin/admin)",
-        f"**Lifetime:** {show.ttl} auto-cleanup",
+        f"**Lifetime:** {effective_ttl} auto-cleanup",
     ]
 
     if feature_count:
@@ -190,19 +194,23 @@ def rolling_start_comment(current_show: Show, new_sha: str) -> str:
     return _format_comment(header, bullets)
 
 
-def rolling_success_comment(old_show: Show, new_show: Show) -> str:
+def rolling_success_comment(
+    old_show: Show, new_show: Show, ttl: Optional[str] = None
+) -> str:
     """Rolling update success comment
 
     Args:
         old_show: Previous Show object
-        new_show: New Show object with updated IP, SHA, TTL
+        new_show: New Show object with updated IP, SHA
+        ttl: Override TTL display (PR-level TTL takes precedence)
     """
     links = _create_header_links(new_show.sha)
     header = f"🎪 {links['showtime_link']} updated environment {old_show.short_sha}→{new_show.short_sha} on {links['gha_link']} for {links['commit_link']}"
 
+    effective_ttl = ttl or new_show.ttl
     bullets = [
         f"**Environment:** http://{new_show.ip}:8080 (admin/admin)",
-        f"**Lifetime:** {new_show.ttl} auto-cleanup",
+        f"**Lifetime:** {effective_ttl} auto-cleanup",
         "**Deployment:** Zero-downtime blue-green",
         "**Updates:** New commits create fresh environments automatically",
     ]

@@ -35,6 +35,27 @@ LABEL_DEFINITIONS = {
         "color": "dc3545",  # Red - blocking/danger
         "description": "Block all Showtime operations - maintenance mode",
     },
+    # TTL Override Labels (PR-level, reusable)
+    "🎪 ⌛ 24h": {
+        "color": "FFE4B5",  # Light orange
+        "description": "Environment expires after 24 hours",
+    },
+    "🎪 ⌛ 48h": {
+        "color": "FFE4B5",  # Light orange
+        "description": "Environment expires after 48 hours (default)",
+    },
+    "🎪 ⌛ 72h": {
+        "color": "FFE4B5",  # Light orange
+        "description": "Environment expires after 72 hours",
+    },
+    "🎪 ⌛ 1w": {
+        "color": "FFE4B5",  # Light orange
+        "description": "Environment expires after 1 week",
+    },
+    "🎪 ⌛ close": {
+        "color": "FFE4B5",  # Light orange
+        "description": "Environment expires only when PR is closed",
+    },
 }
 
 # Status-specific label patterns (generated dynamically)
@@ -90,8 +111,15 @@ def get_label_description(label_text: str) -> str:
         return f"Environment {sha} URL: http://{url} (click to visit)"
 
     if " ⌛ " in label_text:
-        sha, ttl = label_text.replace("🎪 ", "").split(" ⌛ ")
-        return f"Environment {sha} expires after {ttl}"
+        parts = label_text.replace("🎪 ", "").split(" ⌛ ")
+        if len(parts) == 1:
+            # PR-level TTL: "🎪 ⌛ 1w" -> parts = ["1w"] after split
+            ttl = parts[0]
+            return f"Environment expires after {ttl}"
+        else:
+            # Per-SHA TTL (legacy): "🎪 abc123f ⌛ 1w"
+            sha, ttl = parts
+            return f"Environment {sha} expires after {ttl}"
 
     if " 🤡 " in label_text:
         sha, user = label_text.replace("🎪 ", "").split(" 🤡 ")
