@@ -202,12 +202,14 @@ def rolling_success_comment(
     Args:
         old_show: Previous Show object
         new_show: New Show object with updated IP, SHA
-        ttl: Override TTL display (PR-level TTL takes precedence)
+        ttl: TTL display string (required - TTL is now PR-level, not per-Show)
     """
+    from .constants import DEFAULT_TTL
+
     links = _create_header_links(new_show.sha)
     header = f"🎪 {links['showtime_link']} updated environment {old_show.short_sha}→{new_show.short_sha} on {links['gha_link']} for {links['commit_link']}"
 
-    effective_ttl = ttl or new_show.ttl
+    effective_ttl = ttl or DEFAULT_TTL
     bullets = [
         f"**Environment:** http://{new_show.ip}:8080 (admin/admin)",
         f"**Lifetime:** {effective_ttl} auto-cleanup",
