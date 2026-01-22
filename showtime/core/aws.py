@@ -138,6 +138,8 @@ class AWSInterface:
                 if existing_service["service_name"] == service_name:
                     print(f"🗑️ Deleting existing service: {service_name}")
                     self._delete_ecs_service(service_name)
+                    print("✅ Service deletion initiated, waiting for completion...")
+                    self._wait_for_service_deletion(service_name)
                     break
 
             # Step 4: Create fresh service
