@@ -5,6 +5,7 @@ Replicates the AWS logic from current GitHub Actions workflows.
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -12,6 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import boto3  # type: ignore[import-untyped]
+
+# Module logger for machine-readable events (separate from CLI print statements)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,15 +45,19 @@ class AWSInterface:
         region: Optional[str] = None,
         cluster: Optional[str] = None,
         repository: Optional[str] = None,
+        # Optional client injection for testing with Stubber
+        ecs_client: Optional[Any] = None,
+        ecr_client: Optional[Any] = None,
+        ec2_client: Optional[Any] = None,
     ):
         self.region = region or os.getenv("AWS_REGION", "us-west-2")
         self.cluster = cluster or os.getenv("ECS_CLUSTER", "superset-ci")
         self.repository = repository or os.getenv("ECR_REPOSITORY", "superset-ci")
 
-        # AWS clients
-        self.ecs_client = boto3.client("ecs", region_name=self.region)
-        self.ecr_client = boto3.client("ecr", region_name=self.region)
-        self.ec2_client = boto3.client("ec2", region_name=self.region)
+        # AWS clients - use injected or create defaults
+        self.ecs_client = ecs_client or boto3.client("ecs", region_name=self.region)
+        self.ecr_client = ecr_client or boto3.client("ecr", region_name=self.region)
+        self.ec2_client = ec2_client or boto3.client("ec2", region_name=self.region)
 
         # Network configuration (from current GHA)
         self.subnets = ["subnet-0e15a5034b4121710", "subnet-0e8efef4a72224974"]
@@ -867,6 +875,11 @@ class AWSInterface:
                             f"✅ Service {service_name} deletion confirmed (was already draining)"
                         )
                     else:
+                        # Log machine-readable event for diagnostics
+                        logger.info(
+                            "draining_complete",
+                            extra={"service_name": service_name, "wait_seconds": attempt * 5},
+                        )
                         print(f"✅ Service {service_name} fully deleted after {attempt * 5}s")
                     return True
 
@@ -875,9 +888,18 @@ class AWSInterface:
 
                 time.sleep(5)  # Check every 5 seconds
 
+            # Log timeout for diagnostics
+            logger.warning(
+                "deletion_timeout",
+                extra={"service_name": service_name, "timeout_minutes": timeout_minutes},
+            )
             print(f"⚠️ Service deletion timeout after {timeout_minutes} minutes")
             return False
 
         except Exception as e:
+            logger.error(
+                "deletion_error",
+                extra={"service_name": service_name, "error": str(e)},
+            )
             print(f"❌ Error waiting for service deletion: {e}")
             return False
