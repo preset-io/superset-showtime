@@ -130,17 +130,19 @@ class AWSInterface:
             if not task_def_arn:
                 return EnvironmentResult(success=False, error="Failed to create task definition")
 
-            # Step 3: Clean slate - Delete any existing service with this exact name
+            # Step 3: Clean slate - Ensure no service with this exact name exists
+            # CRITICAL: Use _service_exists_any_state() which calls describe_services directly,
+            # NOT _find_pr_services() which uses list_services(). This is because:
+            # - list_services() only returns ACTIVE services
+            # - A service in DRAINING state won't appear in list_services()
+            # - But DRAINING services still block creation with "not idempotent" error
+            # - describe_services() returns services in ANY state (ACTIVE, DRAINING, INACTIVE)
             print(f"🔍 Checking for existing service: {service_name}")
-            existing_services = self._find_pr_services(pr_number)
-
-            for existing_service in existing_services:
-                if existing_service["service_name"] == service_name:
-                    print(f"🗑️ Deleting existing service: {service_name}")
-                    self._delete_ecs_service(service_name)
-                    print("✅ Service deletion initiated, waiting for completion...")
-                    self._wait_for_service_deletion(service_name)
-                    break
+            if self._service_exists_any_state(service_name):
+                print(f"🗑️ Found existing service (may be DRAINING): {service_name}")
+                self._delete_ecs_service(service_name)
+                print("✅ Service deletion initiated, waiting for completion...")
+                self._wait_for_service_deletion(service_name)
 
             # Step 4: Create fresh service
             print(f"🆕 Creating service: {service_name}")
@@ -377,6 +379,37 @@ class AWSInterface:
 
             for service in response["services"]:
                 if service["status"] == "ACTIVE":
+                    return True
+
+            return False
+
+        except Exception:
+            return False
+
+    def _service_exists_any_state(self, service_name: str) -> bool:
+        """Check if ECS service exists in a state that blocks CreateService.
+
+        Unlike _service_exists() which only checks for ACTIVE services, this method
+        also detects DRAINING services. This is critical because:
+        - list_services() only returns ACTIVE services
+        - A service in DRAINING state still blocks CreateService with "not idempotent" error
+        - describe_services() returns services in any state
+
+        Note: INACTIVE services do NOT block CreateService, so we don't check for them.
+
+        Use this method before creating a service to detect DRAINING services
+        from previous failed/cancelled deployments.
+        """
+        try:
+            response = self.ecs_client.describe_services(
+                cluster=self.cluster, services=[service_name]
+            )
+
+            for service in response.get("services", []):
+                status = service.get("status", "")
+                # ACTIVE = running, DRAINING = being deleted
+                # INACTIVE services don't block CreateService, so we ignore them
+                if status in ["ACTIVE", "DRAINING"]:
                     return True
 
             return False
@@ -817,15 +850,18 @@ class AWSInterface:
             return False
 
     def _wait_for_service_deletion(self, service_name: str, timeout_minutes: int = 5) -> bool:
-        """Wait for ECS service to be fully deleted"""
+        """Wait for ECS service to be fully deleted (not just DRAINING)"""
         import time
 
         try:
             max_attempts = timeout_minutes * 12  # 5s intervals
 
             for attempt in range(max_attempts):
-                # Check if service still exists
-                if not self._service_exists(service_name):
+                # Check if service still exists in any blocking state (ACTIVE or DRAINING)
+                # CRITICAL: Use _service_exists_any_state, not _service_exists, because
+                # _service_exists only checks ACTIVE. A DRAINING service still blocks
+                # CreateService with "not idempotent" error.
+                if not self._service_exists_any_state(service_name):
                     if attempt == 0:
                         print(
                             f"✅ Service {service_name} deletion confirmed (was already draining)"
