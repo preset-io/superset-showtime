@@ -1,7 +1,7 @@
 """
-Stubber flow test - verifies full create_environment orchestration with Stubber.
+Stubber flow tests - verify full create_environment orchestration with Stubber.
 
-This is the ONE high-level flow test. It verifies the complete orchestration
+These are high-level flow tests. They verify the complete orchestration
 of create_environment with realistic AWS stubbing. Fast, deterministic, runs in CI.
 
 Note: time.sleep and httpx health checks must be patched since Stubber only handles boto3.
