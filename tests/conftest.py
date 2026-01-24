@@ -6,8 +6,8 @@ Provides:
 - Stubber-based fixtures for behavior-based AWS tests
 """
 
-import pytest
 import boto3
+import pytest
 from botocore.config import Config
 from botocore.stub import Stubber
 

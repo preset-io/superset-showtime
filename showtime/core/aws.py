@@ -150,7 +150,12 @@ class AWSInterface:
                 print(f"🗑️ Found existing service (may be DRAINING): {service_name}")
                 self._delete_ecs_service(service_name)
                 print("✅ Service deletion initiated, waiting for completion...")
-                self._wait_for_service_deletion(service_name)
+                if not self._wait_for_service_deletion(service_name):
+                    return EnvironmentResult(
+                        success=False,
+                        error=f"Timeout waiting for existing service {service_name} to be deleted. "
+                        "Service may still be DRAINING. Retry after a few minutes.",
+                    )
 
             # Step 4: Create fresh service
             print(f"🆕 Creating service: {service_name}")
@@ -407,6 +412,9 @@ class AWSInterface:
 
         Use this method before creating a service to detect DRAINING services
         from previous failed/cancelled deployments.
+
+        Returns True conservatively on errors (throttling, transient failures) to
+        force the delete/wait path rather than skip it and hit "not idempotent".
         """
         try:
             response = self.ecs_client.describe_services(
@@ -422,8 +430,17 @@ class AWSInterface:
 
             return False
 
-        except Exception:
-            return False
+        except Exception as e:
+            # Conservative: return True on errors (throttling, transient AWS issues)
+            # This forces the delete/wait path rather than skipping it.
+            # Skipping would cause "Creation of service was not idempotent" if
+            # a service actually exists but we couldn't detect it.
+            logger.warning(
+                "service_check_error",
+                extra={"service_name": service_name, "error": str(e), "returning": True},
+            )
+            print(f"⚠️ Could not check service state, assuming exists: {e}")
+            return True
 
     def _create_ecs_service(
         self, service_name: str, pr_number: int, github_user: str, task_def_arn: str
@@ -467,14 +484,20 @@ class AWSInterface:
     def _wait_for_deployment_and_get_ip(
         self, service_name: str, timeout_minutes: int = 10
     ) -> Optional[str]:
-        """Wait for ECS deployment to complete and get IP"""
+        """Wait for ECS deployment to complete and get IP.
+
+        NOTE: This is a legacy helper, not currently used. The main flow uses
+        _wait_for_service_stability + _health_check_service + get_environment_ip
+        separately for better error handling.
+        """
         try:
             # Wait for service stability (replicate GHA wait-for-service-stability)
             waiter = self.ecs_client.get_waiter("services_stable")
+            # Delay=30s, maxAttempts=timeout_minutes*2 gives us timeout_minutes of wait time
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"maxAttempts": timeout_minutes * 2},  # 30s intervals
+                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
             )
 
             # Get IP after deployment is stable
@@ -796,10 +819,12 @@ class AWSInterface:
         try:
             # Use ECS waiter - same as GHA wait-for-service-stability
             waiter = self.ecs_client.get_waiter("services_stable")
+            # Delay=30s, maxAttempts=timeout_minutes*2 gives us timeout_minutes of wait time
+            # (e.g., 10 min = 20 attempts * 30s = 600s)
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"maxAttempts": timeout_minutes * 2},  # 30s intervals
+                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
             )
 
             print(f"✅ Service {service_name} is stable")
@@ -816,16 +841,19 @@ class AWSInterface:
         import httpx
 
         try:
-            # Get service IP
-            ip = self.get_environment_ip(service_name)
-            if not ip:
-                print("❌ Could not get service IP for health check")
-                return False
-
-            health_url = f"http://{ip}:8080/health"  # Superset health endpoint
-            fallback_url = f"http://{ip}:8080/"  # Fallback to main page
-
             for attempt in range(max_attempts):
+                # Get service IP inside loop - IP may not be available immediately
+                # after service becomes stable (ENI attachment can lag)
+                ip = self.get_environment_ip(service_name)
+                if not ip:
+                    print(f"⚠️ Health check attempt {attempt + 1}: No IP yet, retrying...")
+                    if attempt < max_attempts - 1:
+                        time.sleep(30)
+                    continue
+
+                health_url = f"http://{ip}:8080/health"  # Superset health endpoint
+                fallback_url = f"http://{ip}:8080/"  # Fallback to main page
+
                 try:
                     with httpx.Client(timeout=10.0) as client:
                         # Try health endpoint first

@@ -7,9 +7,6 @@ Uses botocore.stub.Stubber for realistic AWS response simulation.
 from typing import Any
 from unittest.mock import patch
 
-import pytest
-from botocore.stub import Stubber
-
 from showtime.core.aws import AWSInterface
 
 
@@ -17,7 +14,7 @@ class TestDescribeServicesFailures:
     """Edge cases for describe_services API failures"""
 
     def test_handles_access_denied_gracefully(self, ecs_client_with_stubber: Any) -> None:
-        """Access denied should return False, not raise"""
+        """Access denied should return True (conservative - assume service exists to force wait)"""
         client, stubber = ecs_client_with_stubber
 
         stubber.add_client_error(
@@ -30,10 +27,12 @@ class TestDescribeServicesFailures:
         with stubber:
             result = aws._service_exists_any_state("pr-1234-abc123f-service")
 
-        assert result is False
+        # Conservative: return True on error to force delete/wait path
+        # This prevents skipping the wait and hitting "not idempotent" error
+        assert result is True
 
     def test_handles_cluster_not_found(self, ecs_client_with_stubber: Any) -> None:
-        """ClusterNotFoundException should return False"""
+        """ClusterNotFoundException should return True (conservative - force wait)"""
         client, stubber = ecs_client_with_stubber
 
         stubber.add_client_error(
@@ -46,10 +45,11 @@ class TestDescribeServicesFailures:
         with stubber:
             result = aws._service_exists_any_state("pr-1234-abc123f-service")
 
-        assert result is False
+        # Conservative: return True on error to force delete/wait path
+        assert result is True
 
     def test_handles_throttling(self, ecs_client_with_stubber: Any) -> None:
-        """ThrottlingException should return False (graceful degradation)"""
+        """ThrottlingException should return True (conservative - force wait)"""
         client, stubber = ecs_client_with_stubber
 
         stubber.add_client_error(
@@ -62,10 +62,11 @@ class TestDescribeServicesFailures:
         with stubber:
             result = aws._service_exists_any_state("pr-1234-abc123f-service")
 
-        assert result is False
+        # Conservative: return True on throttling to retry rather than skip wait
+        assert result is True
 
     def test_handles_internal_service_error(self, ecs_client_with_stubber: Any) -> None:
-        """InternalServiceException should not crash"""
+        """InternalServiceException should return True (conservative - force wait)"""
         client, stubber = ecs_client_with_stubber
 
         stubber.add_client_error(
@@ -78,7 +79,8 @@ class TestDescribeServicesFailures:
         with stubber:
             result = aws._service_exists_any_state("pr-1234-abc123f-service")
 
-        assert result is False
+        # Conservative: return True on server error to retry rather than skip wait
+        assert result is True
 
 
 class TestEmptyResponses:
@@ -286,20 +288,34 @@ class TestWaitForServiceDeletionEdgeCases:
 
         assert result is False
 
-    def test_handles_error_during_wait(self, ecs_client_with_stubber: Any) -> None:
-        """Error during deletion wait should return False"""
+    def test_handles_error_during_wait_then_succeeds(self, ecs_client_with_stubber: Any) -> None:
+        """Transient error during wait should retry and eventually succeed"""
         client, stubber = ecs_client_with_stubber
 
+        # First call: error (conservative: assume exists, retry)
         stubber.add_client_error(
             "describe_services",
             service_error_code="AccessDeniedException",
             service_message="Access denied",
         )
 
+        # Second call: service is gone
+        stubber.add_response(
+            "describe_services",
+            {"services": [], "failures": []},
+            expected_params={"cluster": "superset-ci", "services": ["pr-1234-abc123f-service"]},
+        )
+
         aws = AWSInterface(ecs_client=client)
         with stubber:
-            result = aws._wait_for_service_deletion("pr-1234-abc123f-service", timeout_minutes=1)
+            with patch("time.sleep"):  # Speed up test
+                result = aws._wait_for_service_deletion(
+                    "pr-1234-abc123f-service", timeout_minutes=1
+                )
 
-        # Returns False because _service_exists_any_state returns False on error
-        # This is graceful degradation - the service is treated as "gone"
-        assert result is True  # First check says "not exists" -> done
+        # Error causes retry, then service is gone -> success
+        assert result is True
+
+        # Verify both stubbed calls were consumed (error + success)
+        # This ensures the retry behavior is actually happening
+        stubber.assert_no_pending_responses()

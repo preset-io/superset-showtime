@@ -11,7 +11,7 @@ to complete before attempting to create a new service.
 """
 
 from typing import Any, List
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 
 class TestECSServiceDeletionRaceCondition:
@@ -387,3 +387,46 @@ class TestECSServiceDeletionRaceCondition:
         assert result is False, "Should return False when service stays DRAINING past timeout"
         # Should have made multiple attempts
         assert aws.ecs_client.describe_services.call_count >= 10, "Should have retried multiple times"
+
+    def test_create_environment_fails_when_deletion_wait_times_out(self) -> None:
+        """
+        Test that create_environment returns an error (not proceeds to create)
+        when _wait_for_service_deletion times out.
+
+        This prevents the cascading failure where we attempt to create a service
+        that still exists, resulting in "Creation of service was not idempotent".
+        """
+        aws = self._create_mock_aws_interface()
+
+        create_called = False
+
+        def track_create(*args: Any, **kwargs: Any) -> bool:
+            nonlocal create_called
+            create_called = True
+            return True
+
+        # Mock _service_exists_any_state to return True (existing service found)
+        # Mock _wait_for_service_deletion to return False (timeout)
+        with patch.object(aws, "_service_exists_any_state", return_value=True):
+            with patch.object(
+                aws, "_create_task_definition_with_image_and_flags", return_value="arn:task-def"
+            ):
+                with patch.object(aws, "_delete_ecs_service", return_value=True):
+                    with patch.object(aws, "_wait_for_service_deletion", return_value=False):
+                        with patch.object(aws, "_create_ecs_service", side_effect=track_create):
+                            result = aws.create_environment(
+                                pr_number=1234,
+                                sha="abc123f",
+                                github_user="testuser",
+                            )
+
+        # Should return error, NOT proceed to create
+        assert result.success is False, "Should fail when deletion wait times out"
+        assert result.error is not None, "Should have an error message"
+        assert "timeout" in result.error.lower() or "deleted" in result.error.lower(), (
+            f"Error should mention timeout or deletion issue: {result.error}"
+        )
+        assert not create_called, (
+            "Should NOT call _create_ecs_service when deletion wait times out - "
+            "this would cause 'Creation of service was not idempotent' error"
+        )

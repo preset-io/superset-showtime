@@ -7,11 +7,10 @@ of create_environment with realistic AWS stubbing. Fast, deterministic, runs in 
 Note: time.sleep and httpx health checks must be patched since Stubber only handles boto3.
 """
 
-from typing import Any, Dict
+from typing import Any
 from unittest.mock import Mock, patch
 
-import pytest
-from botocore.stub import Stubber, ANY
+from botocore.stub import ANY, Stubber
 
 
 class TestCreateEnvironmentStubberFlow:
