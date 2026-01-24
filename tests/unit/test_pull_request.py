@@ -224,17 +224,22 @@ def test_pullrequest_create_new_show() -> None:
     pr = PullRequest(1234, [])
 
     # Mock format_utc_now for consistent testing
+    # Mock get_current_actor to return "unknown" (CI sets GITHUB_ACTOR env var)
     with patch("showtime.core.date_utils.format_utc_now") as mock_format:
-        mock_format.return_value = "2024-01-15T14-30"
+        with patch(
+            "showtime.core.pull_request.GitHubInterface.get_current_actor",
+            return_value="unknown",
+        ):
+            mock_format.return_value = "2024-01-15T14-30"
 
-        show = pr._create_new_show("abc123f1234567890abcdef")
+            show = pr._create_new_show("abc123f1234567890abcdef")
 
-        assert show.pr_number == 1234
-        assert show.sha == "abc123f"  # Shortened
-        assert show.status == "building"
-        assert show.created_at == "2024-01-15T14-30"
-        assert show.requested_by == "unknown"  # Default when no actor set
-        # Note: TTL is now PR-level, not per-Show
+            assert show.pr_number == 1234
+            assert show.sha == "abc123f"  # Shortened
+            assert show.status == "building"
+            assert show.created_at == "2024-01-15T14-30"
+            assert show.requested_by == "unknown"  # Default when no actor set
+            # Note: TTL is now PR-level, not per-Show
 
 
 @patch("showtime.core.pull_request.get_github")
