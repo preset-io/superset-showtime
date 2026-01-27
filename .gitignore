@@ -147,3 +147,6 @@ cython_debug/
 # Showtime specific
 .showtime/
 config.yml
+
+# Project documentation (local use only)
+PROJECT.md

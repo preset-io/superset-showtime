@@ -5,6 +5,7 @@ Replicates the AWS logic from current GitHub Actions workflows.
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -12,6 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import boto3  # type: ignore[import-untyped]
+
+# Module logger for machine-readable events (separate from CLI print statements)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,15 +45,19 @@ class AWSInterface:
         region: Optional[str] = None,
         cluster: Optional[str] = None,
         repository: Optional[str] = None,
+        # Optional client injection for testing with Stubber
+        ecs_client: Optional[Any] = None,
+        ecr_client: Optional[Any] = None,
+        ec2_client: Optional[Any] = None,
     ):
         self.region = region or os.getenv("AWS_REGION", "us-west-2")
         self.cluster = cluster or os.getenv("ECS_CLUSTER", "superset-ci")
         self.repository = repository or os.getenv("ECR_REPOSITORY", "superset-ci")
 
-        # AWS clients
-        self.ecs_client = boto3.client("ecs", region_name=self.region)
-        self.ecr_client = boto3.client("ecr", region_name=self.region)
-        self.ec2_client = boto3.client("ec2", region_name=self.region)
+        # AWS clients - use injected or create defaults
+        self.ecs_client = ecs_client or boto3.client("ecs", region_name=self.region)
+        self.ecr_client = ecr_client or boto3.client("ecr", region_name=self.region)
+        self.ec2_client = ec2_client or boto3.client("ec2", region_name=self.region)
 
         # Network configuration (from current GHA)
         self.subnets = ["subnet-0e15a5034b4121710", "subnet-0e8efef4a72224974"]
@@ -130,17 +138,24 @@ class AWSInterface:
             if not task_def_arn:
                 return EnvironmentResult(success=False, error="Failed to create task definition")
 
-            # Step 3: Clean slate - Delete any existing service with this exact name
+            # Step 3: Clean slate - Ensure no service with this exact name exists
+            # CRITICAL: Use _service_exists_any_state() which calls describe_services directly,
+            # NOT _find_pr_services() which uses list_services(). This is because:
+            # - list_services() only returns ACTIVE services
+            # - A service in DRAINING state won't appear in list_services()
+            # - But DRAINING services still block creation with "not idempotent" error
+            # - describe_services() returns services in ANY state (ACTIVE, DRAINING, INACTIVE)
             print(f"🔍 Checking for existing service: {service_name}")
-            existing_services = self._find_pr_services(pr_number)
-
-            for existing_service in existing_services:
-                if existing_service["service_name"] == service_name:
-                    print(f"🗑️ Deleting existing service: {service_name}")
-                    self._delete_ecs_service(service_name)
-                    print("✅ Service deletion initiated, waiting for completion...")
-                    self._wait_for_service_deletion(service_name)
-                    break
+            if self._service_exists_any_state(service_name):
+                print(f"🗑️ Found existing service (may be DRAINING): {service_name}")
+                self._delete_ecs_service(service_name)
+                print("✅ Service deletion initiated, waiting for completion...")
+                if not self._wait_for_service_deletion(service_name):
+                    return EnvironmentResult(
+                        success=False,
+                        error=f"Timeout waiting for existing service {service_name} to be deleted. "
+                        "Service may still be DRAINING. Retry after a few minutes.",
+                    )
 
             # Step 4: Create fresh service
             print(f"🆕 Creating service: {service_name}")
@@ -384,6 +399,49 @@ class AWSInterface:
         except Exception:
             return False
 
+    def _service_exists_any_state(self, service_name: str) -> bool:
+        """Check if ECS service exists in a state that blocks CreateService.
+
+        Unlike _service_exists() which only checks for ACTIVE services, this method
+        also detects DRAINING services. This is critical because:
+        - list_services() only returns ACTIVE services
+        - A service in DRAINING state still blocks CreateService with "not idempotent" error
+        - describe_services() returns services in any state
+
+        Note: INACTIVE services do NOT block CreateService, so we don't check for them.
+
+        Use this method before creating a service to detect DRAINING services
+        from previous failed/cancelled deployments.
+
+        Returns True conservatively on errors (throttling, transient failures) to
+        force the delete/wait path rather than skip it and hit "not idempotent".
+        """
+        try:
+            response = self.ecs_client.describe_services(
+                cluster=self.cluster, services=[service_name]
+            )
+
+            for service in response.get("services", []):
+                status = service.get("status", "")
+                # ACTIVE = running, DRAINING = being deleted
+                # INACTIVE services don't block CreateService, so we ignore them
+                if status in ["ACTIVE", "DRAINING"]:
+                    return True
+
+            return False
+
+        except Exception as e:
+            # Conservative: return True on errors (throttling, transient AWS issues)
+            # This forces the delete/wait path rather than skipping it.
+            # Skipping would cause "Creation of service was not idempotent" if
+            # a service actually exists but we couldn't detect it.
+            logger.warning(
+                "service_check_error",
+                extra={"service_name": service_name, "error": str(e), "returning": True},
+            )
+            print(f"⚠️ Could not check service state, assuming exists: {e}")
+            return True
+
     def _create_ecs_service(
         self, service_name: str, pr_number: int, github_user: str, task_def_arn: str
     ) -> bool:
@@ -426,14 +484,20 @@ class AWSInterface:
     def _wait_for_deployment_and_get_ip(
         self, service_name: str, timeout_minutes: int = 10
     ) -> Optional[str]:
-        """Wait for ECS deployment to complete and get IP"""
+        """Wait for ECS deployment to complete and get IP.
+
+        NOTE: This is a legacy helper, not currently used. The main flow uses
+        _wait_for_service_stability + _health_check_service + get_environment_ip
+        separately for better error handling.
+        """
         try:
             # Wait for service stability (replicate GHA wait-for-service-stability)
             waiter = self.ecs_client.get_waiter("services_stable")
+            # Delay=30s, maxAttempts=timeout_minutes*2 gives us timeout_minutes of wait time
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"maxAttempts": timeout_minutes * 2},  # 30s intervals
+                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
             )
 
             # Get IP after deployment is stable
@@ -755,10 +819,12 @@ class AWSInterface:
         try:
             # Use ECS waiter - same as GHA wait-for-service-stability
             waiter = self.ecs_client.get_waiter("services_stable")
+            # Delay=30s, maxAttempts=timeout_minutes*2 gives us timeout_minutes of wait time
+            # (e.g., 10 min = 20 attempts * 30s = 600s)
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"maxAttempts": timeout_minutes * 2},  # 30s intervals
+                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
             )
 
             print(f"✅ Service {service_name} is stable")
@@ -775,16 +841,19 @@ class AWSInterface:
         import httpx
 
         try:
-            # Get service IP
-            ip = self.get_environment_ip(service_name)
-            if not ip:
-                print("❌ Could not get service IP for health check")
-                return False
-
-            health_url = f"http://{ip}:8080/health"  # Superset health endpoint
-            fallback_url = f"http://{ip}:8080/"  # Fallback to main page
-
             for attempt in range(max_attempts):
+                # Get service IP inside loop - IP may not be available immediately
+                # after service becomes stable (ENI attachment can lag)
+                ip = self.get_environment_ip(service_name)
+                if not ip:
+                    print(f"⚠️ Health check attempt {attempt + 1}: No IP yet, retrying...")
+                    if attempt < max_attempts - 1:
+                        time.sleep(30)
+                    continue
+
+                health_url = f"http://{ip}:8080/health"  # Superset health endpoint
+                fallback_url = f"http://{ip}:8080/"  # Fallback to main page
+
                 try:
                     with httpx.Client(timeout=10.0) as client:
                         # Try health endpoint first
@@ -817,20 +886,28 @@ class AWSInterface:
             return False
 
     def _wait_for_service_deletion(self, service_name: str, timeout_minutes: int = 5) -> bool:
-        """Wait for ECS service to be fully deleted"""
+        """Wait for ECS service to be fully deleted (not just DRAINING)"""
         import time
 
         try:
             max_attempts = timeout_minutes * 12  # 5s intervals
 
             for attempt in range(max_attempts):
-                # Check if service still exists
-                if not self._service_exists(service_name):
+                # Check if service still exists in any blocking state (ACTIVE or DRAINING)
+                # CRITICAL: Use _service_exists_any_state, not _service_exists, because
+                # _service_exists only checks ACTIVE. A DRAINING service still blocks
+                # CreateService with "not idempotent" error.
+                if not self._service_exists_any_state(service_name):
                     if attempt == 0:
                         print(
                             f"✅ Service {service_name} deletion confirmed (was already draining)"
                         )
                     else:
+                        # Log machine-readable event for diagnostics
+                        logger.info(
+                            "draining_complete",
+                            extra={"service_name": service_name, "wait_seconds": attempt * 5},
+                        )
                         print(f"✅ Service {service_name} fully deleted after {attempt * 5}s")
                     return True
 
@@ -839,9 +916,18 @@ class AWSInterface:
 
                 time.sleep(5)  # Check every 5 seconds
 
+            # Log timeout for diagnostics
+            logger.warning(
+                "deletion_timeout",
+                extra={"service_name": service_name, "timeout_minutes": timeout_minutes},
+            )
             print(f"⚠️ Service deletion timeout after {timeout_minutes} minutes")
             return False
 
         except Exception as e:
+            logger.error(
+                "deletion_error",
+                extra={"service_name": service_name, "error": str(e)},
+            )
             print(f"❌ Error waiting for service deletion: {e}")
             return False
