@@ -176,8 +176,9 @@ class AWSInterface:
                 return EnvironmentResult(success=False, error="Service failed to become stable")
 
             # Step 7: Health check the new service (longer timeout for Superset + examples)
+            # Note: Superset example loading takes more tha 10 mins in some cases
             print(f"🏥 Health checking service {service_name}...")
-            if not self._health_check_service(service_name, max_attempts=20):  # 10 minutes total
+            if not self._health_check_service(service_name, max_attempts=30):  # 15 minutes total
                 return EnvironmentResult(success=False, error="Service failed health checks")
 
             # Step 8: Get IP after health checks pass
