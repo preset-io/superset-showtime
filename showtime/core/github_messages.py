@@ -112,13 +112,17 @@ def start_comment(show: Show) -> str:
 
 
 def success_comment(
-    show: Show, feature_count: Optional[int] = None, ttl: Optional[str] = None
+    show: Show,
+    feature_count: Optional[int] = None,
+    feature_names: Optional[List[str]] = None,
+    ttl: Optional[str] = None,
 ) -> str:
     """Environment success comment
 
     Args:
         show: Show object with SHA, IP, etc.
         feature_count: Number of enabled feature flags (optional)
+        feature_names: List of enabled feature flag names (optional)
         ttl: Override TTL display (PR-level TTL takes precedence)
     """
     links = _create_header_links(show.sha)
@@ -131,7 +135,8 @@ def success_comment(
     ]
 
     if feature_count:
-        bullets.insert(-1, f"**Features:** {feature_count} enabled")
+        flag_list = f" ({', '.join(feature_names)})" if feature_names else ""
+        bullets.insert(-1, f"**Features:** {feature_count} flags enabled{flag_list}")
 
     bullets.append("**Updates:** New commits create fresh environments automatically")
 
@@ -195,13 +200,19 @@ def rolling_start_comment(current_show: Show, new_sha: str) -> str:
 
 
 def rolling_success_comment(
-    old_show: Show, new_show: Show, ttl: Optional[str] = None
+    old_show: Show,
+    new_show: Show,
+    feature_count: Optional[int] = None,
+    feature_names: Optional[List[str]] = None,
+    ttl: Optional[str] = None,
 ) -> str:
     """Rolling update success comment
 
     Args:
         old_show: Previous Show object
         new_show: New Show object with updated IP, SHA
+        feature_count: Number of enabled feature flags (optional)
+        feature_names: List of enabled feature flag names (optional)
         ttl: TTL display string (required - TTL is now PR-level, not per-Show)
     """
     from .constants import DEFAULT_TTL
@@ -214,8 +225,13 @@ def rolling_success_comment(
         f"**Environment:** http://{new_show.ip}:8080 (admin/admin)",
         f"**Lifetime:** {effective_ttl} auto-cleanup",
         "**Deployment:** Zero-downtime blue-green",
-        "**Updates:** New commits create fresh environments automatically",
     ]
+
+    if feature_count:
+        flag_list = f" ({', '.join(feature_names)})" if feature_names else ""
+        bullets.append(f"**Features:** {feature_count} flags enabled{flag_list}")
+
+    bullets.append("**Updates:** New commits create fresh environments automatically")
 
     return _format_comment(header, bullets)
 

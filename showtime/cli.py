@@ -436,6 +436,78 @@ def list(
 
 
 @app.command()
+def flags(
+    pr_number: int = typer.Argument(..., help="PR number to manage feature flags for"),
+    add: Optional[str] = typer.Option(None, "--add", help="Add flag: FLAG_NAME=true/false"),
+    remove: Optional[str] = typer.Option(None, "--remove", help="Remove flag by name: FLAG_NAME"),
+) -> None:
+    """🚩 Manage Superset feature flags via GitHub labels"""
+    from .core.feature_flags import (
+        create_feature_flag_label,
+        parse_feature_flag_label,
+    )
+
+    try:
+        pr = PullRequest.from_id(pr_number)
+
+        if add:
+            if "=" not in add:
+                p(f"❌ Invalid flag format: {add}")
+                p("Expected: FLAG_NAME=true or FLAG_NAME=false")
+                raise typer.Exit(1)
+
+            label = create_feature_flag_label(*add.split("=", 1))
+            if not parse_feature_flag_label(label):
+                p(f"❌ Invalid flag: {add}")
+                p("Flag name must be uppercase with underscores, value must be true/false")
+                raise typer.Exit(1)
+
+            pr.add_label(label)
+            p(f"🚩 Added: {label}")
+            p("Flag will take effect on next deployment (push or trigger-start)")
+            return
+
+        if remove:
+            flag_name = remove.strip().upper()
+            removed = False
+            for val in ["true", "false"]:
+                label = create_feature_flag_label(flag_name, val)
+                if label in pr.labels:
+                    pr.remove_label(label)
+                    p(f"🚩 Removed: {label}")
+                    removed = True
+            if not removed:
+                p(f"🚩 No feature flag label found for {flag_name}")
+            return
+
+        # Default: list current feature flags
+        feature_flags = pr.get_feature_flags()
+        if not feature_flags:
+            p(f"🚩 No feature flags set for PR #{pr_number}")
+            p("Add flags with: showtime flags {pr} --add EMBEDDED_SUPERSET=true")
+            return
+
+        table = Table(title=f"🚩 Feature Flags - PR #{pr_number}")
+        table.add_column("Flag", style="cyan")
+        table.add_column("Enabled", style="green")
+        table.add_column("Label", style="dim")
+
+        for flag_name, enabled in sorted(feature_flags.items()):
+            status = "✅ true" if enabled else "❌ false"
+            label = create_feature_flag_label(flag_name, "true" if enabled else "false")
+            table.add_row(flag_name, status, label)
+
+        p(table)
+
+    except GitHubError as e:
+        p(f"❌ GitHub error: {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        p(f"❌ Error: {e}")
+        raise typer.Exit(1) from e
+
+
+@app.command()
 def labels() -> None:
     """🎪 Show complete circus tent label reference"""
     from .core.label_colors import LABEL_DEFINITIONS
@@ -473,6 +545,17 @@ def labels() -> None:
     state_table.add_row("🎪 {sha} 🤡 {username}", "Requested by", "🎪 abc123f 🤡 maxime")
 
     p(state_table)
+    p()
+
+    # Feature Flag Labels
+    p("[bold magenta]🚩 Feature Flag Labels (PR-level, persist across rebuilds):[/bold magenta]")
+    flag_table = Table()
+    flag_table.add_column("Label", style="green")
+    flag_table.add_column("Description", style="dim")
+    flag_table.add_row("🎪 🚩 FLAG_NAME=true", "Enable a Superset feature flag")
+    flag_table.add_row("🎪 🚩 FLAG_NAME=false", "Disable a Superset feature flag")
+    p(flag_table)
+    p("[dim]💡 Use 'showtime flags <pr>' to manage feature flags via CLI[/dim]")
     p()
 
     # Workflow Examples
@@ -720,7 +803,9 @@ def cleanup(
             if max_age_cap_hours:
                 p(f"   (with max age cap of {max_age_cap_hours}h)")
         else:
-            p(f"🎪 [bold blue]Cleaning environments older than {default_max_age_hours}h...[/bold blue]")
+            p(
+                f"🎪 [bold blue]Cleaning environments older than {default_max_age_hours}h...[/bold blue]"
+            )
 
         # Get all PRs with environments
         pr_numbers = PullRequest.find_all_with_environments()
@@ -751,7 +836,9 @@ def cleanup(
                             continue
                         else:
                             # Invalid/unparsable TTL label - warn and use default
-                            p(f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h")
+                            p(
+                                f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h"
+                            )
                             effective_max_age = default_max_age_hours
                     else:
                         # No TTL label - use default

@@ -19,6 +19,7 @@ EMOJI_MEANINGS = {
     "🌐": "ip",  # Globe for IP address
     "⌛": "ttl",  # Hourglass for time-to-live
     "🤡": "requested_by",  # Clown for who requested (circus theme!)
+    "🚩": "feature_flag",  # Flag for Superset FEATURE_FLAGS
 }
 
 # Reverse mapping for creating labels
