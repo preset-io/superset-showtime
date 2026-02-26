@@ -5,7 +5,7 @@ Handles atomic transactions, trigger processing, and environment orchestration.
 """
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
 from .github import GitHubInterface
@@ -143,6 +143,30 @@ class PullRequest:
                 return label.replace("🎪 ⌛ ", "").strip()
 
         return DEFAULT_TTL
+
+    def get_feature_flags(self) -> Dict[str, bool]:
+        """Get feature flags from PR-level labels.
+
+        Looks for reusable PR-level feature flag labels like "🎪 🚩 EMBEDDED_SUPERSET=true".
+
+        Returns:
+            Dict mapping flag name to enabled status.
+            Example: {"EMBEDDED_SUPERSET": True, "DASHBOARD_NATIVE_FILTERS": False}
+        """
+        from .feature_flags import extract_feature_flags_from_labels
+
+        return extract_feature_flags_from_labels(self.labels)
+
+    def get_feature_flags_as_aws_env(self) -> List[Dict[str, str]]:
+        """Get feature flags formatted for AWS ECS environment variables.
+
+        Returns:
+            List of {"name": "SUPERSET_FEATURE_X", "value": "True"/"False"} dicts.
+            Empty list if no feature flags are set.
+        """
+        from .feature_flags import feature_flags_to_aws_env
+
+        return feature_flags_to_aws_env(self.get_feature_flags())
 
     def _parse_shows_from_labels(self) -> List[Show]:
         """Parse all shows from circus tent labels"""
@@ -367,6 +391,15 @@ class PullRequest:
         }
         action_needed = action_map.get(action_needed_str, ActionNeeded.NO_ACTION)
 
+        # Check if feature flags need hot-update even when no deployment action
+        has_feature_flags = bool(self.get_feature_flags())
+        needs_flag_update = (
+            action_needed == ActionNeeded.NO_ACTION
+            and has_feature_flags
+            and self.current_show is not None
+            and self.current_show.is_running
+        )
+
         # Build sync state
         return SyncState(
             action_needed=action_needed,
@@ -376,7 +409,8 @@ class PullRequest:
                 ActionNeeded.ROLLING_UPDATE,
                 ActionNeeded.AUTO_SYNC,
             ],
-            sync_needed=action_needed not in [ActionNeeded.NO_ACTION, ActionNeeded.BLOCKED],
+            sync_needed=action_needed not in [ActionNeeded.NO_ACTION, ActionNeeded.BLOCKED]
+            or needs_flag_update,
             target_sha=target_sha,
             github_actor=auth_debug.get("actor", "unknown"),
             is_github_actions=auth_debug.get("is_github_actions", False),
@@ -524,6 +558,13 @@ class PullRequest:
                 )
             print("✅ Environment claimed successfully")
 
+        # Extract feature flags from PR labels (PR-level, persist across rebuilds)
+        feature_flags_env = self.get_feature_flags_as_aws_env()
+        if feature_flags_env:
+            print(f"🚩 Feature flags: {len(feature_flags_env)} flags set")
+            for ff in feature_flags_env:
+                print(f"   • {ff['name']}={ff['value']}")
+
         try:
             # 3. Execute action with error handling
             if action_needed == "create_environment":
@@ -539,7 +580,7 @@ class PullRequest:
                 # Phase 2: AWS deployment
                 print("☁️ Deploying to AWS ECS...")
                 self.set_show_status(show, "deploying")
-                show.deploy_aws(dry_run_aws)
+                show.deploy_aws(dry_run_aws, feature_flags=feature_flags_env)
                 self.set_show_status(show, "running")
                 self.set_active_show(show)
                 print(f"✅ Deployment completed - environment running at {show.ip}:8080")
@@ -576,7 +617,7 @@ class PullRequest:
                 # Phase 2: Blue-green deployment
                 print("☁️ Deploying updated environment...")
                 self.set_show_status(new_show, "deploying")
-                new_show.deploy_aws(dry_run_aws)
+                new_show.deploy_aws(dry_run_aws, feature_flags=feature_flags_env)
                 self.set_show_status(new_show, "running")
                 self.set_active_show(new_show)
                 print(f"✅ Rolling update completed - new environment at {new_show.ip}:8080")
@@ -616,6 +657,34 @@ class PullRequest:
                 return SyncResult(success=True, action_taken="destroy_environment")
 
             else:
+                # No deployment action needed - but check for feature flag changes
+                # on the running environment and hot-update if needed
+                if feature_flags_env and self.current_show and self.current_show.is_running:
+                    from .feature_flags import feature_flags_to_prefixed_dict
+
+                    prefixed_flags = feature_flags_to_prefixed_dict(self.get_feature_flags())
+                    print(
+                        f"🚩 Hot-updating {len(prefixed_flags)} feature flags on "
+                        f"{self.current_show.ecs_service_name}..."
+                    )
+                    success = self.current_show.update_feature_flags(
+                        prefixed_flags, dry_run=dry_run_aws
+                    )
+                    if success:
+                        print("✅ Feature flags updated (container will restart)")
+                        return SyncResult(
+                            success=True,
+                            action_taken="update_feature_flags",
+                            show=self.current_show,
+                        )
+                    else:
+                        print("⚠️ Feature flag hot-update failed")
+                        return SyncResult(
+                            success=False,
+                            action_taken="update_feature_flags",
+                            error="Feature flag hot-update failed",
+                        )
+
                 return SyncResult(success=True, action_taken="no_action")
 
         except Exception as e:
@@ -924,7 +993,14 @@ class PullRequest:
 
         if not dry_run:
             effective_ttl = self._get_effective_ttl_display()
-            comment = success_comment(show, ttl=effective_ttl)
+            feature_flags = self.get_feature_flags()
+            feature_names = sorted(name for name, enabled in feature_flags.items() if enabled)
+            comment = success_comment(
+                show,
+                feature_count=len(feature_names) if feature_names else None,
+                feature_names=feature_names if feature_names else None,
+                ttl=effective_ttl,
+            )
             get_github().post_comment(self.pr_number, comment)
 
     def _post_rolling_start_comment(
@@ -946,7 +1022,15 @@ class PullRequest:
 
         if not dry_run:
             effective_ttl = self._get_effective_ttl_display()
-            comment = rolling_success_comment(old_show, new_show, ttl=effective_ttl)
+            feature_flags = self.get_feature_flags()
+            feature_names = sorted(name for name, enabled in feature_flags.items() if enabled)
+            comment = rolling_success_comment(
+                old_show,
+                new_show,
+                feature_count=len(feature_names) if feature_names else None,
+                feature_names=feature_names if feature_names else None,
+                ttl=effective_ttl,
+            )
             get_github().post_comment(self.pr_number, comment)
 
     def _post_cleanup_comment(self, show: Show, dry_run: bool = False) -> None:

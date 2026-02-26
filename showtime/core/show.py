@@ -6,7 +6,7 @@ Single environment operations: Docker build, AWS deployment, state transitions.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # Import interfaces for singleton access
@@ -135,7 +135,11 @@ class Show:
         if not dry_run:
             self._build_docker_image()  # Raises on failure
 
-    def deploy_aws(self, dry_run: bool = False) -> None:
+    def deploy_aws(
+        self,
+        dry_run: bool = False,
+        feature_flags: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
         """Deploy to AWS (atomic operation)"""
         github, aws = get_interfaces()
 
@@ -144,6 +148,7 @@ class Show:
                 pr_number=self.pr_number,
                 sha=self.sha + "0" * (40 - len(self.sha)),  # Convert to full SHA
                 github_user=self.requested_by or "unknown",
+                feature_flags=feature_flags,
             )
 
             if not result.success:
@@ -154,6 +159,30 @@ class Show:
         else:
             # Mock successful deployment for dry-run
             self.ip = "52.1.2.3"
+
+    def update_feature_flags(
+        self,
+        feature_flags: Dict[str, bool],
+        dry_run: bool = False,
+    ) -> bool:
+        """Hot-update feature flags on a running environment.
+
+        Updates the ECS task definition with new env vars and triggers a rolling
+        restart. No Docker rebuild needed.
+
+        Args:
+            feature_flags: Dict with SUPERSET_FEATURE_ prefixed keys and bool values.
+            dry_run: If True, skip actual AWS call.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if dry_run:
+            print(f"🚩 [DRY-RUN] Would hot-update {len(feature_flags)} feature flags")
+            return True
+
+        _, aws = get_interfaces()
+        return aws.update_feature_flags(self.ecs_service_name, feature_flags)
 
     def stop(self, dry_run_github: bool = False, dry_run_aws: bool = False) -> bool:
         """Stop this environment (cleanup AWS resources)
@@ -170,12 +199,62 @@ class Show:
 
         return True  # Dry run is always "successful"
 
+    def _inject_config_overlay(self) -> None:
+        """Inject superset_config_docker.py into the build context.
+
+        Copies our config overlay into the Superset repo's build context and
+        appends a COPY instruction to the Dockerfile so the config ends up in
+        /app/pythonpath/ inside the image.  This ensures SUPERSET_FEATURE_*
+        env vars always override FEATURE_FLAGS, even if a superset_config.py
+        is present.
+        """
+        import shutil
+        from pathlib import Path
+
+        # Source: bundled config overlay in our package data
+        src = Path(__file__).parent.parent / "data" / "superset_config_docker.py"
+        if not src.exists():
+            print("⚠️ superset_config_docker.py not found, skipping config injection")
+            return
+
+        # Destination: build context (current working directory = Superset repo)
+        dest = Path("docker") / "pythonpath_dev" / "superset_config_docker.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        print(f"🚩 Injected {dest} into build context")
+
+        # Append a COPY instruction to the Dockerfile so it ends up in the image
+        dockerfile = Path("Dockerfile")
+        if not dockerfile.exists():
+            print("⚠️ Dockerfile not found, skipping Dockerfile patching")
+            return
+
+        content = dockerfile.read_text()
+        if "superset_config_docker.py" in content:
+            print("🚩 Dockerfile already has config overlay, skipping patch")
+            return
+
+        # Add a COPY after the showtime stage definition
+        patched = content.replace(
+            "FROM lean AS showtime",
+            "FROM lean AS showtime\n"
+            "COPY docker/pythonpath_dev/superset_config_docker.py /app/pythonpath/",
+        )
+        if patched != content:
+            dockerfile.write_text(patched)
+            print("🚩 Patched Dockerfile to COPY config overlay into /app/pythonpath/")
+        else:
+            print("⚠️ Could not find showtime stage in Dockerfile, skipping patch")
+
     def _build_docker_image(self) -> None:
         """Build Docker image for this environment"""
         import os
         import subprocess
 
         tag = f"apache/superset:pr-{self.pr_number}-{self.sha}-ci"
+
+        # Inject config overlay so SUPERSET_FEATURE_* env vars work
+        self._inject_config_overlay()
 
         # Detect if running in CI environment
         is_ci = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
