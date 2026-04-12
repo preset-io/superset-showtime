@@ -4,8 +4,9 @@
 Handles atomic transactions, trigger processing, and environment orchestration.
 """
 
+import re
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
 from .github import GitHubInterface
@@ -32,6 +33,23 @@ def get_aws() -> AWSInterface:
 
 
 # Use get_github() and get_aws() directly in methods
+
+
+def parse_feature_flags(description: Optional[str]) -> List[Dict[str, str]]:
+    """Extract feature flags from PR description.
+
+    Parses lines matching FEATURE_(name)=(value) and transforms them to
+    ECS environment variable format: [{"name": "SUPERSET_FEATURE_X", "value": "true"}]
+    """
+    if not description:
+        return []
+
+    flags: List[Dict[str, str]] = []
+    for match in re.finditer(r"FEATURE_(\w+)=(\w+)", description):
+        name = f"SUPERSET_FEATURE_{match.group(1)}"
+        value = match.group(2).lower()
+        flags.append({"name": name, "value": value})
+    return flags
 
 
 @dataclass
@@ -524,6 +542,18 @@ class PullRequest:
                 )
             print("✅ Environment claimed successfully")
 
+        # 3a. Extract feature flags from PR description
+        feature_flags: List[Dict[str, str]] = []
+        if action_needed != "destroy_environment":
+            try:
+                pr_data = get_github().get_pr_data(self.pr_number)
+                feature_flags = parse_feature_flags(pr_data.get("body"))
+                if feature_flags:
+                    flag_names = [f["name"] for f in feature_flags]
+                    print(f"🏁 Feature flags from PR description: {', '.join(flag_names)}")
+            except Exception as e:
+                print(f"⚠️ Failed to fetch PR description for feature flags: {e}")
+
         try:
             # 3. Execute action with error handling
             if action_needed == "create_environment":
@@ -539,7 +569,7 @@ class PullRequest:
                 # Phase 2: AWS deployment
                 print("☁️ Deploying to AWS ECS...")
                 self.set_show_status(show, "deploying")
-                show.deploy_aws(dry_run_aws)
+                show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
                 self.set_show_status(show, "running")
                 self.set_active_show(show)
                 print(f"✅ Deployment completed - environment running at {show.ip}:8080")
@@ -576,7 +606,7 @@ class PullRequest:
                 # Phase 2: Blue-green deployment
                 print("☁️ Deploying updated environment...")
                 self.set_show_status(new_show, "deploying")
-                new_show.deploy_aws(dry_run_aws)
+                new_show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
                 self.set_show_status(new_show, "running")
                 self.set_active_show(new_show)
                 print(f"✅ Rolling update completed - new environment at {new_show.ip}:8080")
@@ -616,6 +646,11 @@ class PullRequest:
                 return SyncResult(success=True, action_taken="destroy_environment")
 
             else:
+                # Check if feature flags need updating on running environment
+                if feature_flags and self.current_show and self.current_show.status == "running":
+                    self._update_feature_flags_if_changed(
+                        self.current_show, feature_flags, dry_run_aws
+                    )
                 return SyncResult(success=True, action_taken="no_action")
 
         except Exception as e:
@@ -897,6 +932,30 @@ class PullRequest:
             default_ttl_label = f"🎪 ⌛ {DEFAULT_TTL}"
             print(f"🏷️ Auto-creating TTL label: {default_ttl_label}")
             self.add_label(default_ttl_label)
+
+    def _update_feature_flags_if_changed(
+        self,
+        show: Show,
+        feature_flags: List[Dict[str, str]],
+        dry_run: bool = False,
+    ) -> None:
+        """Update feature flags on a running environment if they differ from desired state."""
+        if dry_run:
+            print(f"🏁 [dry-run] Would update feature flags on {show.sha}")
+            return
+
+        # Convert list format to dict format expected by aws.update_feature_flags
+        flags_dict: Dict[str, bool] = {}
+        for flag in feature_flags:
+            flags_dict[flag["name"]] = flag["value"].lower() in ("true", "1", "yes")
+
+        aws = get_aws()
+        print(f"🏁 Updating feature flags on running environment {show.sha}...")
+        success = aws.update_feature_flags(show.ecs_service_name, flags_dict)
+        if success:
+            print("✅ Feature flags updated successfully")
+        else:
+            print("⚠️ Feature flag update failed")
 
     def _create_new_show(self, target_sha: str) -> Show:
         """Create a new Show object for the target SHA"""
