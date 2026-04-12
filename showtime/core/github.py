@@ -82,15 +82,29 @@ class GitHubInterface:
         }
 
     def get_labels(self, pr_number: int) -> List[str]:
-        """Get all labels for a PR"""
+        """Get all labels for a PR (paginated)"""
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/labels"
+        all_labels: List[str] = []
+        page = 1
 
         with httpx.Client() as client:
-            response = client.get(url, headers=self.headers)
-            response.raise_for_status()
+            while True:
+                response = client.get(
+                    url, headers=self.headers, params={"per_page": 100, "page": page}
+                )
+                response.raise_for_status()
 
-            labels_data = response.json()
-            return [label["name"] for label in labels_data]
+                labels_data = response.json()
+                if not labels_data:
+                    break
+
+                all_labels.extend(label["name"] for label in labels_data)
+
+                if len(labels_data) < 100:
+                    break
+                page += 1
+
+        return all_labels
 
     def add_label(self, pr_number: int, label: str) -> None:
         """Add a label to a PR (automatically creates label definition if needed)"""
@@ -156,22 +170,41 @@ class GitHubInterface:
         for label in circus_labels:
             self.remove_label(pr_number, label)
 
-    def find_prs_with_shows(self) -> List[int]:
-        """Find all PRs that have circus tent labels"""
-        # Search for issues with circus tent labels (updated for SHA-first format)
+    def find_prs_with_shows(self, include_closed: bool = False) -> List[int]:
+        """Find all PRs that have circus tent labels (paginated)
+
+        Args:
+            include_closed: If True, also search closed/merged PRs. Useful for
+                orphan detection since closed PRs may still have label definitions.
+        """
         url = f"{self.base_url}/search/issues"
-        # Search for PRs with any circus tent labels
-        params = {
-            "q": f"repo:{self.org}/{self.repo} is:pr is:open 🎪",
-            "per_page": "100",
-        }  # Only open PRs - closed PRs should have cleaned up labels
+        state_filter = "" if include_closed else "is:open "
+        all_pr_numbers: List[int] = []
+        page = 1
 
         with httpx.Client() as client:
-            response = client.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
+            while True:
+                params = {
+                    "q": f"repo:{self.org}/{self.repo} is:pr {state_filter}🎪",
+                    "per_page": "100",
+                    "page": str(page),
+                }
 
-            issues = response.json()["items"]
-            return [issue["number"] for issue in issues]
+                response = client.get(url, headers=self.headers, params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                items = data["items"]
+                if not items:
+                    break
+
+                all_pr_numbers.extend(issue["number"] for issue in items)
+
+                if len(items) < 100:
+                    break
+                page += 1
+
+        return all_pr_numbers
 
     def post_comment(self, pr_number: int, body: str) -> None:
         """Post a comment on a PR"""
@@ -193,15 +226,29 @@ class GitHubInterface:
             return False
 
     def get_repository_labels(self) -> List[str]:
-        """Get all labels defined in the repository"""
+        """Get all labels defined in the repository (paginated)"""
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/labels"
+        all_labels: List[str] = []
+        page = 1
 
         with httpx.Client() as client:
-            response = client.get(url, headers=self.headers, params={"per_page": 100})
-            response.raise_for_status()
+            while True:
+                response = client.get(
+                    url, headers=self.headers, params={"per_page": 100, "page": page}
+                )
+                response.raise_for_status()
 
-            labels_data = response.json()
-            return [label["name"] for label in labels_data]
+                labels_data = response.json()
+                if not labels_data:
+                    break
+
+                all_labels.extend(label["name"] for label in labels_data)
+
+                if len(labels_data) < 100:
+                    break
+                page += 1
+
+        return all_labels
 
     def delete_repository_label(self, label_name: str) -> bool:
         """Delete a label definition from the repository"""
@@ -260,15 +307,9 @@ class GitHubInterface:
         # 2. Get all labels actually used on PRs with circus labels
         print("🔍 Scanning PRs with circus labels...")
 
-        # Import here to avoid circular import
-        import importlib
-
-        pull_request_module = importlib.import_module("showtime.core.pull_request")
-        PullRequest = pull_request_module.PullRequest
-
         try:
-            pr_numbers = PullRequest.find_all_with_environments()
-            print(f"📋 Found {len(pr_numbers)} PRs with circus labels")
+            pr_numbers = self.find_prs_with_shows(include_closed=True)
+            print(f"📋 Found {len(pr_numbers)} PRs with circus labels (open + closed)")
 
             used_labels = set()
             for pr_number in pr_numbers:
@@ -295,9 +336,15 @@ class GitHubInterface:
 
             if not dry_run and orphaned_labels:
                 deleted_labels = []
-                for label in orphaned_labels:
+                total = len(orphaned_labels)
+                for i, label in enumerate(orphaned_labels, 1):
                     if self.delete_repository_label(label):
                         deleted_labels.append(label)
+                    if i % 50 == 0:
+                        print(f"🗑️ Progress: {i}/{total} labels processed...")
+                print(
+                    f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions"
+                )
                 return deleted_labels
 
             return list(orphaned_labels)

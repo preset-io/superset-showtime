@@ -187,24 +187,40 @@ class PullRequest:
         get_github().remove_label(self.pr_number, label)
         self.labels.discard(label)  # Safe - won't raise if not present
 
-    def remove_sha_labels(self, sha: str) -> None:
-        """Remove all labels for a specific SHA"""
+    def remove_sha_labels(self, sha: str, delete_definitions: bool = True) -> None:
+        """Remove all labels for a specific SHA and optionally delete repo-level definitions"""
         sha_short = sha[:7]
         labels_to_remove = [
             label for label in self.labels if label.startswith("🎪") and sha_short in label
         ]
         if labels_to_remove:
             print(f"🗑️ Removing SHA {sha_short} labels: {labels_to_remove}")
+            github = get_github() if delete_definitions else None
             for label in labels_to_remove:
                 self.remove_label(label)
+                if delete_definitions and github:
+                    github.delete_repository_label(label)
 
-    def remove_showtime_labels(self) -> None:
-        """Remove ALL circus tent labels"""
+    def remove_showtime_labels(self, delete_definitions: bool = True) -> None:
+        """Remove ALL circus tent labels from PR and optionally delete repo-level definitions.
+
+        Args:
+            delete_definitions: If True, also delete the repo-level label definitions
+                for SHA-containing labels to prevent orphaned label accumulation.
+        """
+        import re
+
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
+            github = get_github()
+            sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
             for label in circus_labels:
                 self.remove_label(label)
+                # Delete repo-level definition for SHA-based labels (dynamic/per-env)
+                # Static trigger labels (e.g. showtime-trigger-start) are kept
+                if delete_definitions and sha_pattern.match(label):
+                    github.delete_repository_label(label)
 
     def set_show_status(self, show: Show, new_status: str) -> None:
         """Atomically update show status with thorough label cleanup"""
