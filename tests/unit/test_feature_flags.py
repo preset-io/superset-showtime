@@ -311,8 +311,11 @@ class TestShowDeployAwsFeatureFlags:
             feature_flags=None,
         )
 
-    def test_deploy_aws_dry_run_ignores_flags(self) -> None:
+    @patch("showtime.core.show.get_interfaces")
+    def test_deploy_aws_dry_run_ignores_flags(self, mock_get_interfaces: Mock) -> None:
         """In dry-run mode, feature flags are accepted but AWS is not called"""
+        mock_get_interfaces.return_value = (Mock(), Mock())
+
         show = Show(pr_number=1234, sha="abc123f", status="deploying")
         flags = [{"name": "SUPERSET_FEATURE_X", "value": "true"}]
 
