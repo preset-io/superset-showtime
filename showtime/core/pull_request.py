@@ -208,18 +208,17 @@ class PullRequest:
             delete_definitions: If True, also delete the repo-level label definitions
                 for SHA-containing labels to prevent orphaned label accumulation.
         """
-        import re
+        from .github import is_sha_label
 
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
             github = get_github()
-            sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
             for label in circus_labels:
                 self.remove_label(label)
                 # Delete repo-level definition for SHA-based labels (dynamic/per-env)
                 # Static trigger labels (e.g. showtime-trigger-start) are kept
-                if delete_definitions and sha_pattern.match(label):
+                if delete_definitions and is_sha_label(label):
                     github.delete_repository_label(label)
 
     def set_show_status(self, show: Show, new_status: str) -> None:
@@ -885,8 +884,11 @@ class PullRequest:
             building_show.status = "building"
 
             # Update labels to reflect building state - only remove for this SHA
+            # Skip deleting repo-level definitions here since _update_show_labels
+            # will immediately re-create them via _ensure_label_definition_exists.
+            # Orphan cleanup sweeps handle stale definitions periodically.
             print(f"🏷️ Removing labels for SHA {target_sha[:7]}...")
-            self.remove_sha_labels(target_sha)
+            self.remove_sha_labels(target_sha, delete_definitions=False)
 
             new_labels = building_show.to_circus_labels()
             print(f"🏷️ Creating new labels: {new_labels}")
@@ -1041,9 +1043,14 @@ class PullRequest:
         return cleaned_count
 
     @classmethod
-    def find_all_with_environments(cls) -> List[int]:
-        """Find all PR numbers that have active environments"""
-        return get_github().find_prs_with_shows()
+    def find_all_with_environments(cls, include_closed: bool = False) -> List[int]:
+        """Find all PR numbers that have active environments.
+
+        Args:
+            include_closed: If True, also include closed/merged PRs. Useful for
+                orphan detection where closed PRs may still have label definitions.
+        """
+        return get_github().find_prs_with_shows(include_closed=include_closed)
 
     def _update_show_labels(self, show: Show, dry_run: bool = False) -> None:
         """Update GitHub labels to reflect show state with proper status replacement"""

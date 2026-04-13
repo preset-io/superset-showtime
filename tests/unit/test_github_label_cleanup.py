@@ -7,13 +7,64 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from showtime.core.github import GitHubInterface
+from showtime.core.github import GitHubInterface, is_sha_label
 
 
 @pytest.fixture
 def github():
     """Create a GitHubInterface with a fake token"""
     return GitHubInterface(token="fake-token", org="test-org", repo="test-repo")
+
+
+class TestIsShaLabel:
+    """Tests for the is_sha_label helper function"""
+
+    def test_status_label(self) -> None:
+        assert is_sha_label("🎪 abc123f 🚦 running") is True
+
+    def test_ip_label(self) -> None:
+        assert is_sha_label("🎪 abc123f 🌐 52.1.2.3:8080") is True
+
+    def test_timestamp_label(self) -> None:
+        assert is_sha_label("🎪 abc123f 📅 2024-01-15T14-30") is True
+
+    def test_pointer_label(self) -> None:
+        assert is_sha_label("🎪 🎯 abc123f") is True
+
+    def test_static_trigger_label(self) -> None:
+        assert is_sha_label("🎪 ⚡ showtime-trigger-start") is False
+
+    def test_freeze_label(self) -> None:
+        assert is_sha_label("🎪 🧊 showtime-freeze") is False
+
+    def test_non_circus_label(self) -> None:
+        assert is_sha_label("bug") is False
+
+    def test_short_hex_not_matched(self) -> None:
+        assert is_sha_label("🎪 ab12 🚦 running") is False
+
+
+class TestPaginate:
+    """Tests for the _paginate helper"""
+
+    def test_unwrap_function(self, github: GitHubInterface) -> None:
+        """unwrap extracts the list from nested JSON (e.g. search API)"""
+        mock_response = Mock()
+        mock_response.json.return_value = {"items": [{"id": 1}, {"id": 2}]}
+        mock_response.raise_for_status = Mock()
+
+        with patch("httpx.Client") as mock_client:
+            mock_client.return_value.__enter__ = Mock(return_value=mock_client.return_value)
+            mock_client.return_value.__exit__ = Mock(return_value=False)
+            mock_client.return_value.get.return_value = mock_response
+
+            result = github._paginate(
+                "https://api.github.com/search/issues",
+                unwrap=lambda d: d["items"],
+            )
+
+        assert len(result) == 2
+        assert result[0] == {"id": 1}
 
 
 class TestGetRepositoryLabelsPagination:

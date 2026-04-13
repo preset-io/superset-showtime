@@ -645,8 +645,9 @@ def test_pullrequest_atomic_claim_success(mock_get_github: Mock) -> None:
                     assert result is True
                     # Verify trigger labels removed
                     mock_remove_label.assert_called_with("🎪 ⚡ showtime-trigger-start")
-                    # Verify SHA labels removed
-                    mock_remove_sha.assert_called_with("abc123f")
+                    # Verify SHA labels removed (without deleting definitions to
+                    # avoid wasteful re-creation in _update_show_labels)
+                    mock_remove_sha.assert_called_with("abc123f", delete_definitions=False)
 
 
 @patch("showtime.core.pull_request.get_github")

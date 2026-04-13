@@ -6,10 +6,19 @@ and circus tent emoji state synchronization.
 """
 
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+
+# SHA-containing circus label pattern: 🎪 followed by 7+ hex chars anywhere
+SHA_LABEL_PATTERN = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
+
+
+def is_sha_label(label: str) -> bool:
+    """Check if a circus tent label contains a SHA (dynamic/per-environment label)."""
+    return bool(SHA_LABEL_PATTERN.match(label))
 
 # Constants
 DEFAULT_GITHUB_ACTOR = "unknown"
@@ -81,30 +90,47 @@ class GitHubInterface:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def get_labels(self, pr_number: int) -> List[str]:
-        """Get all labels for a PR (paginated)"""
-        url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/labels"
-        all_labels: List[str] = []
+    def _paginate(
+        self,
+        url: str,
+        params: Optional[Dict[str, str]] = None,
+        unwrap: Optional[Callable[[Any], List[Any]]] = None,
+    ) -> List[Any]:
+        """Paginate a GitHub API list endpoint.
+
+        Args:
+            url: The API endpoint URL.
+            params: Extra query parameters (per_page/page are added automatically).
+            unwrap: Optional function to extract the list from the response JSON.
+                    Defaults to treating the response itself as the list.
+        """
+        all_items: List[Any] = []
         page = 1
+        base_params = dict(params or {})
 
         with httpx.Client() as client:
             while True:
-                response = client.get(
-                    url, headers=self.headers, params={"per_page": 100, "page": page}
-                )
+                page_params = {**base_params, "per_page": "100", "page": str(page)}
+                response = client.get(url, headers=self.headers, params=page_params)
                 response.raise_for_status()
 
-                labels_data = response.json()
-                if not labels_data:
+                data = response.json()
+                items = unwrap(data) if unwrap else data
+                if not items:
                     break
 
-                all_labels.extend(label["name"] for label in labels_data)
+                all_items.extend(items)
 
-                if len(labels_data) < 100:
+                if len(items) < 100:
                     break
                 page += 1
 
-        return all_labels
+        return all_items
+
+    def get_labels(self, pr_number: int) -> List[str]:
+        """Get all labels for a PR (paginated)"""
+        url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/labels"
+        return [item["name"] for item in self._paginate(url)]
 
     def add_label(self, pr_number: int, label: str) -> None:
         """Add a label to a PR (automatically creates label definition if needed)"""
@@ -179,32 +205,12 @@ class GitHubInterface:
         """
         url = f"{self.base_url}/search/issues"
         state_filter = "" if include_closed else "is:open "
-        all_pr_numbers: List[int] = []
-        page = 1
-
-        with httpx.Client() as client:
-            while True:
-                params = {
-                    "q": f"repo:{self.org}/{self.repo} is:pr {state_filter}🎪",
-                    "per_page": "100",
-                    "page": str(page),
-                }
-
-                response = client.get(url, headers=self.headers, params=params)
-                response.raise_for_status()
-
-                data = response.json()
-                items = data["items"]
-                if not items:
-                    break
-
-                all_pr_numbers.extend(issue["number"] for issue in items)
-
-                if len(items) < 100:
-                    break
-                page += 1
-
-        return all_pr_numbers
+        items = self._paginate(
+            url,
+            params={"q": f"repo:{self.org}/{self.repo} is:pr {state_filter}🎪"},
+            unwrap=lambda data: data["items"],
+        )
+        return [issue["number"] for issue in items]
 
     def post_comment(self, pr_number: int, body: str) -> None:
         """Post a comment on a PR"""
@@ -228,27 +234,7 @@ class GitHubInterface:
     def get_repository_labels(self) -> List[str]:
         """Get all labels defined in the repository (paginated)"""
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/labels"
-        all_labels: List[str] = []
-        page = 1
-
-        with httpx.Client() as client:
-            while True:
-                response = client.get(
-                    url, headers=self.headers, params={"per_page": 100, "page": page}
-                )
-                response.raise_for_status()
-
-                labels_data = response.json()
-                if not labels_data:
-                    break
-
-                all_labels.extend(label["name"] for label in labels_data)
-
-                if len(labels_data) < 100:
-                    break
-                page += 1
-
-        return all_labels
+        return [item["name"] for item in self._paginate(url)]
 
     def delete_repository_label(self, label_name: str) -> bool:
         """Delete a label definition from the repository"""
@@ -270,17 +256,8 @@ class GitHubInterface:
 
     def cleanup_sha_labels(self, dry_run: bool = False) -> List[str]:
         """Clean up all circus tent labels with SHA patterns from repository"""
-        import re
-
         all_labels = self.get_repository_labels()
-        sha_labels = []
-
-        # Find labels with SHA patterns (7+ hex chars anywhere in label)
-        sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
-
-        for label in all_labels:
-            if sha_pattern.match(label):
-                sha_labels.append(label)
+        sha_labels = [label for label in all_labels if is_sha_label(label)]
 
         if not dry_run:
             deleted_labels = []
@@ -293,14 +270,11 @@ class GitHubInterface:
 
     def find_orphaned_labels(self, dry_run: bool = False) -> List[str]:
         """Find labels that exist in repository but aren't used on any PR"""
-        import re
-
         print("🔍 Scanning repository labels...")
 
         # 1. Get all repository labels with SHA patterns
         all_repo_labels = self.get_repository_labels()
-        sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
-        sha_repo_labels = {label for label in all_repo_labels if sha_pattern.match(label)}
+        sha_repo_labels = {label for label in all_repo_labels if is_sha_label(label)}
 
         print(f"📋 Found {len(sha_repo_labels)} SHA-containing labels in repository")
 
