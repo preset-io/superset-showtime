@@ -81,6 +81,22 @@ End of description"""
         result = parse_feature_flags(description)
         assert len(result) == 1
 
+    def test_invalid_value_skipped(self) -> None:
+        """Invalid values like typos are skipped with a warning"""
+        result = parse_feature_flags("FEATURE_X=tru\nFEATURE_Y=true")
+        assert len(result) == 1
+        assert result[0] == {"name": "SUPERSET_FEATURE_Y", "value": "true"}
+
+    def test_all_valid_values_accepted(self) -> None:
+        """All boolean-like values are accepted"""
+        description = (
+            "FEATURE_A=true\nFEATURE_B=false\n"
+            "FEATURE_C=1\nFEATURE_D=0\n"
+            "FEATURE_E=yes\nFEATURE_F=no"
+        )
+        result = parse_feature_flags(description)
+        assert len(result) == 6
+
 
 class TestFeatureFlagsInSync:
     """Tests for feature flag threading through sync()"""
@@ -171,7 +187,7 @@ class TestFeatureFlagsInSync:
     def test_sync_updates_flags_on_running_env(
         self, mock_get_github: Mock, mock_get_aws: Mock
     ) -> None:
-        """When env is running and no action needed, feature flags are updated if present"""
+        """When env is running and flags differ from current, update is triggered"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
         mock_aws = Mock()
@@ -185,6 +201,11 @@ class TestFeatureFlagsInSync:
         mock_github.get_labels.return_value = labels
         mock_github.get_pr_data.return_value = {
             "body": "FEATURE_ALERTS=true\nFEATURE_EMBEDDED=false"
+        }
+        # Current flags differ from desired (ALERTS was False, now should be True)
+        mock_aws.get_current_feature_flags.return_value = {
+            "SUPERSET_FEATURE_ALERTS": "False",
+            "SUPERSET_FEATURE_EMBEDDED": "False",
         }
         mock_aws.update_feature_flags.return_value = True
 
@@ -203,6 +224,38 @@ class TestFeatureFlagsInSync:
                 "SUPERSET_FEATURE_EMBEDDED": False,
             },
         )
+
+    @patch("showtime.core.pull_request.get_aws")
+    @patch("showtime.core.pull_request.get_github")
+    def test_sync_skips_update_when_flags_match(
+        self, mock_get_github: Mock, mock_get_aws: Mock
+    ) -> None:
+        """When env is running and flags already match, no update is triggered"""
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+        mock_aws = Mock()
+        mock_get_aws.return_value = mock_aws
+
+        labels = [
+            "🎪 abc123f 🚦 running",
+            "🎪 🎯 abc123f",
+        ]
+        mock_github.get_labels.return_value = labels
+        mock_github.get_pr_data.return_value = {
+            "body": "FEATURE_ALERTS=true"
+        }
+        # Current flags already match desired
+        mock_aws.get_current_feature_flags.return_value = {
+            "SUPERSET_FEATURE_ALERTS": "True",
+        }
+
+        pr = PullRequest(1234, labels)
+
+        result = pr.sync("abc123f")
+
+        assert result.success is True
+        assert result.action_taken == "no_action"
+        mock_aws.update_feature_flags.assert_not_called()
 
     @patch("showtime.core.pull_request.get_aws")
     @patch("showtime.core.pull_request.get_github")

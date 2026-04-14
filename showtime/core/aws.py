@@ -573,6 +573,35 @@ class AWSInterface:
         except Exception as e:
             raise AWSError(message=str(e), operation="cleanup_orphaned_environments") from e
 
+    def get_current_feature_flags(self, service_name: str) -> Dict[str, str]:
+        """Get current SUPERSET_FEATURE_* env vars from a running ECS service.
+
+        Returns dict of {name: value} for all SUPERSET_FEATURE_* vars,
+        or empty dict on failure.
+        """
+        try:
+            service_response = self.ecs_client.describe_services(
+                cluster=self.cluster, services=[service_name]
+            )
+            if not service_response["services"]:
+                return {}
+
+            task_def_arn = service_response["services"][0]["taskDefinition"]
+            task_def_response = self.ecs_client.describe_task_definition(
+                taskDefinition=task_def_arn
+            )
+            task_def = task_def_response["taskDefinition"]
+            env_vars = task_def["containerDefinitions"][0].get("environment", [])
+
+            return {
+                e["name"]: e["value"]
+                for e in env_vars
+                if e["name"].startswith("SUPERSET_FEATURE_")
+            }
+        except Exception as e:
+            print(f"⚠️ Failed to fetch current feature flags: {e}")
+            return {}
+
     def update_feature_flags(self, service_name: str, feature_flags: Dict[str, bool]) -> bool:
         """Update feature flags in running environment"""
         try:

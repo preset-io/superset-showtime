@@ -35,11 +35,16 @@ def get_aws() -> AWSInterface:
 # Use get_github() and get_aws() directly in methods
 
 
+VALID_FLAG_VALUES = {"true", "false", "1", "0", "yes", "no"}
+
+
 def parse_feature_flags(description: Optional[str]) -> List[Dict[str, str]]:
     """Extract feature flags from PR description.
 
     Parses lines matching FEATURE_(name)=(value) and transforms them to
     ECS environment variable format: [{"name": "SUPERSET_FEATURE_X", "value": "true"}]
+
+    Only accepts boolean-like values (true/false/1/0/yes/no). Invalid values are skipped.
     """
     if not description:
         return []
@@ -48,6 +53,9 @@ def parse_feature_flags(description: Optional[str]) -> List[Dict[str, str]]:
     for match in re.finditer(r"FEATURE_(\w+)=(\w+)", description):
         name = f"SUPERSET_FEATURE_{match.group(1)}"
         value = match.group(2).lower()
+        if value not in VALID_FLAG_VALUES:
+            print(f"⚠️ Skipping feature flag {name}: invalid value '{match.group(2)}' (expected true/false/1/0/yes/no)")
+            continue
         flags.append({"name": name, "value": value})
     return flags
 
@@ -939,17 +947,26 @@ class PullRequest:
         feature_flags: List[Dict[str, str]],
         dry_run: bool = False,
     ) -> None:
-        """Update feature flags on a running environment if they differ from desired state."""
-        if dry_run:
-            print(f"🏁 [dry-run] Would update feature flags on {show.sha}")
-            return
-
+        """Update feature flags on a running environment only if they differ from current state."""
         # Convert list format to dict format expected by aws.update_feature_flags
         flags_dict: Dict[str, bool] = {}
         for flag in feature_flags:
             flags_dict[flag["name"]] = flag["value"].lower() in ("true", "1", "yes")
 
+        if dry_run:
+            print(f"🏁 [dry-run] Would check/update feature flags on {show.sha}")
+            return
+
         aws = get_aws()
+
+        # Fetch current flags from ECS and compare
+        current_flags = aws.get_current_feature_flags(show.ecs_service_name)
+        desired_flags = {k: ("True" if v else "False") for k, v in flags_dict.items()}
+
+        if current_flags == desired_flags:
+            print(f"🏁 Feature flags on {show.sha} already match desired state, skipping update")
+            return
+
         print(f"🏁 Updating feature flags on running environment {show.sha}...")
         success = aws.update_feature_flags(show.ecs_service_name, flags_dict)
         if success:
