@@ -187,7 +187,7 @@ class PullRequest:
         get_github().remove_label(self.pr_number, label)
         self.labels.discard(label)  # Safe - won't raise if not present
 
-    def remove_sha_labels(self, sha: str, delete_definitions: bool = True) -> None:
+    def remove_sha_labels(self, sha: str, delete_definitions: bool = False) -> None:
         """Remove all labels for a specific SHA and optionally delete repo-level definitions"""
         sha_short = sha[:7]
         labels_to_remove = [
@@ -201,12 +201,13 @@ class PullRequest:
                 if delete_definitions and github:
                     github.delete_repository_label(label)
 
-    def remove_showtime_labels(self, delete_definitions: bool = True) -> None:
+    def remove_showtime_labels(self, delete_definitions: bool = False) -> None:
         """Remove ALL circus tent labels from PR and optionally delete repo-level definitions.
 
         Args:
             delete_definitions: If True, also delete the repo-level label definitions
                 for SHA-containing labels to prevent orphaned label accumulation.
+                Only pass True from teardown/cleanup paths (stop, destroy).
         """
         from .github import is_sha_label
 
@@ -625,7 +626,7 @@ class PullRequest:
 
                 # ALWAYS remove all circus labels for stop trigger, regardless of current_show
                 if not dry_run_github:
-                    self.remove_showtime_labels()
+                    self.remove_showtime_labels(delete_definitions=True)
                     print("🏷️ GitHub labels cleaned up")
                 print("✅ Environment destroyed")
                 return SyncResult(success=True, action_taken="destroy_environment")
@@ -662,7 +663,7 @@ class PullRequest:
 
             # ALWAYS remove all circus labels for stop command, regardless of current_show
             if not kwargs.get("dry_run_github", False):
-                self.remove_showtime_labels()
+                self.remove_showtime_labels(delete_definitions=True)
                 print("🏷️ GitHub labels cleaned up")
             return SyncResult(success=True, action_taken="stopped")
         except Exception as e:
@@ -1034,7 +1035,7 @@ class PullRequest:
                 success = show.stop(dry_run_github=False, dry_run_aws=False)
                 if success:
                     # Also clean up GitHub labels for this specific show
-                    self.remove_sha_labels(show.sha)
+                    self.remove_sha_labels(show.sha, delete_definitions=True)
                     cleaned_count += 1
                     print(f"✅ Cleaned orphaned environment: {show.sha}")
                 else:

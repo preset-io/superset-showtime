@@ -152,6 +152,31 @@ class TestGetLabelsPagination:
         assert len(result) == 2
         assert "🎪 abc123f 🚦 running" in result
 
+    def test_multiple_pages_pr_labels(self, github: GitHubInterface) -> None:
+        """PR with 100+ labels paginates correctly"""
+        page1 = [{"name": f"label-{i}"} for i in range(100)]
+        page2 = [{"name": "bug"}, {"name": "🎪 abc123f 🚦 running"}]
+
+        mock_resp1 = Mock()
+        mock_resp1.json.return_value = page1
+        mock_resp1.raise_for_status = Mock()
+
+        mock_resp2 = Mock()
+        mock_resp2.json.return_value = page2
+        mock_resp2.raise_for_status = Mock()
+
+        with patch("httpx.Client") as mock_client:
+            mock_client.return_value.__enter__ = Mock(return_value=mock_client.return_value)
+            mock_client.return_value.__exit__ = Mock(return_value=False)
+            mock_client.return_value.get.side_effect = [mock_resp1, mock_resp2]
+
+            result = github.get_labels(1234)
+
+        assert len(result) == 102
+        assert result[0] == "label-0"
+        assert "🎪 abc123f 🚦 running" in result
+        assert mock_client.return_value.get.call_count == 2
+
 
 class TestFindPrsWithShows:
     """Tests for PR search with pagination and closed PR support"""
@@ -285,7 +310,7 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
 
     @patch("showtime.core.pull_request.get_github")
     def test_deletes_sha_label_definitions(self, mock_get_github: Any) -> None:
-        """remove_showtime_labels should delete repo-level definitions for SHA labels"""
+        """remove_showtime_labels(delete_definitions=True) should delete repo-level defs for SHA labels"""
         from showtime.core.pull_request import PullRequest
 
         mock_github = Mock()
@@ -302,7 +327,7 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
             ],
         )
 
-        pr.remove_showtime_labels()
+        pr.remove_showtime_labels(delete_definitions=True)
 
         # All labels removed from PR
         assert mock_github.remove_label.call_count == 5
@@ -319,7 +344,7 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
 
     @patch("showtime.core.pull_request.get_github")
     def test_remove_sha_labels_deletes_definitions(self, mock_get_github: Any) -> None:
-        """remove_sha_labels should also delete repo-level definitions"""
+        """remove_sha_labels(delete_definitions=True) should also delete repo-level definitions"""
         from showtime.core.pull_request import PullRequest
 
         mock_github = Mock()
@@ -334,7 +359,7 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
             ],
         )
 
-        pr.remove_sha_labels("abc123f")
+        pr.remove_sha_labels("abc123f", delete_definitions=True)
 
         # Only abc123f labels removed from PR
         remove_calls = [c.args[1] for c in mock_github.remove_label.call_args_list]
@@ -347,8 +372,8 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
         assert len(delete_calls) == 2
 
     @patch("showtime.core.pull_request.get_github")
-    def test_remove_showtime_labels_skip_definitions(self, mock_get_github: Any) -> None:
-        """delete_definitions=False should skip repo-level deletion"""
+    def test_default_skips_definition_deletion(self, mock_get_github: Any) -> None:
+        """Default (delete_definitions=False) should skip repo-level deletion"""
         from showtime.core.pull_request import PullRequest
 
         mock_github = Mock()
@@ -356,9 +381,24 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
 
         pr = PullRequest(1234, ["🎪 abc123f 🚦 running"])
 
-        pr.remove_showtime_labels(delete_definitions=False)
+        pr.remove_showtime_labels()  # default is now False
 
         # Label removed from PR
         assert mock_github.remove_label.call_count == 1
         # But repo definition NOT deleted
+        mock_github.delete_repository_label.assert_not_called()
+
+    @patch("showtime.core.pull_request.get_github")
+    def test_remove_sha_labels_default_skips_definitions(self, mock_get_github: Any) -> None:
+        """Default remove_sha_labels() should NOT delete repo-level definitions"""
+        from showtime.core.pull_request import PullRequest
+
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+
+        pr = PullRequest(1234, ["🎪 abc123f 🚦 running"])
+
+        pr.remove_sha_labels("abc123f")  # default is now False
+
+        assert mock_github.remove_label.call_count == 1
         mock_github.delete_repository_label.assert_not_called()
