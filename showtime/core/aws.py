@@ -602,40 +602,37 @@ class AWSInterface:
             print(f"⚠️ Failed to fetch current feature flags: {e}")
             return {}
 
-    def update_feature_flags(self, service_name: str, feature_flags: Dict[str, bool]) -> bool:
-        """Update feature flags in running environment"""
+    def reconcile_feature_flags(self, service_name: str, desired_flags: Dict[str, str]) -> bool:
+        """Replace the entire SUPERSET_FEATURE_* set on a running environment.
+
+        Removes all existing SUPERSET_FEATURE_* vars and sets exactly the
+        desired set. An empty desired_flags dict removes all feature flags.
+        """
         try:
-            # Get current task definition
             service_response = self.ecs_client.describe_services(
                 cluster=self.cluster, services=[service_name]
             )
-
             if not service_response["services"]:
                 return False
 
             task_def_arn = service_response["services"][0]["taskDefinition"]
-
-            # Get task definition details
             task_def_response = self.ecs_client.describe_task_definition(
                 taskDefinition=task_def_arn
             )
-
             task_def = task_def_response["taskDefinition"]
 
-            # Update environment variables
             container_def = task_def["containerDefinitions"][0]
             env_vars = container_def.get("environment", [])
 
-            # Update feature flags
-            for flag_name, enabled in feature_flags.items():
-                # Remove existing flag
-                env_vars = [e for e in env_vars if e["name"] != flag_name]
-                # Add updated flag
-                env_vars.append({"name": flag_name, "value": "True" if enabled else "False"})
+            # Remove ALL existing SUPERSET_FEATURE_* vars
+            env_vars = [e for e in env_vars if not e["name"].startswith("SUPERSET_FEATURE_")]
+
+            # Add desired flags
+            for name, value in desired_flags.items():
+                env_vars.append({"name": name, "value": value})
 
             container_def["environment"] = env_vars
 
-            # Register new task definition
             new_task_def = self.ecs_client.register_task_definition(
                 family=task_def["family"],
                 containerDefinitions=task_def["containerDefinitions"],
@@ -647,7 +644,6 @@ class AWSInterface:
                 taskRoleArn=task_def.get("taskRoleArn"),
             )
 
-            # Update service to use new task definition
             self.ecs_client.update_service(
                 cluster=self.cluster,
                 service=service_name,
@@ -657,7 +653,7 @@ class AWSInterface:
             return True
 
         except Exception as e:
-            print(f"Feature flag update failed: {e}")
+            print(f"Feature flag reconciliation failed: {e}")
             return False
 
     def _delete_ecs_service(self, service_name: str) -> bool:

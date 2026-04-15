@@ -23,7 +23,7 @@ class TestParseFeatureFlags:
     def test_single_flag(self) -> None:
         result = parse_feature_flags("FEATURE_DASHBOARD_NATIVE_FILTERS=true")
         assert result == [
-            {"name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS", "value": "true"}
+            {"name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS", "value": "True"}
         ]
 
     def test_multiple_flags(self) -> None:
@@ -39,15 +39,15 @@ FEATURE_ALERT_REPORTS=true
         assert len(result) == 3
         assert result[0] == {
             "name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS",
-            "value": "true",
+            "value": "True",
         }
         assert result[1] == {
             "name": "SUPERSET_FEATURE_ENABLE_TEMPLATE_PROCESSING",
-            "value": "false",
+            "value": "False",
         }
         assert result[2] == {
             "name": "SUPERSET_FEATURE_ALERT_REPORTS",
-            "value": "true",
+            "value": "True",
         }
 
     def test_flags_mixed_with_other_content(self) -> None:
@@ -59,21 +59,22 @@ FEATURE_BAZ=1
 End of description"""
         result = parse_feature_flags(description)
         assert len(result) == 2
-        assert result[0] == {"name": "SUPERSET_FEATURE_FOO", "value": "true"}
-        assert result[1] == {"name": "SUPERSET_FEATURE_BAZ", "value": "1"}
+        assert result[0] == {"name": "SUPERSET_FEATURE_FOO", "value": "True"}
+        assert result[1] == {"name": "SUPERSET_FEATURE_BAZ", "value": "True"}
 
-    def test_values_lowercased(self) -> None:
+    def test_values_normalized(self) -> None:
+        """Values are normalized to canonical 'True'/'False' format"""
         result = parse_feature_flags("FEATURE_X=True")
-        assert result[0]["value"] == "true"
+        assert result[0]["value"] == "True"
 
         result = parse_feature_flags("FEATURE_X=FALSE")
-        assert result[0]["value"] == "false"
+        assert result[0]["value"] == "False"
 
     def test_inline_flag(self) -> None:
         """Flags can appear inline, not just on their own line"""
         result = parse_feature_flags("Please enable FEATURE_X=true for testing")
         assert len(result) == 1
-        assert result[0] == {"name": "SUPERSET_FEATURE_X", "value": "true"}
+        assert result[0] == {"name": "SUPERSET_FEATURE_X", "value": "True"}
 
     def test_code_block_flags(self) -> None:
         """Flags inside code blocks are still matched (regex doesn't know about markdown)"""
@@ -85,7 +86,12 @@ End of description"""
         """Invalid values like typos are skipped with a warning"""
         result = parse_feature_flags("FEATURE_X=tru\nFEATURE_Y=true")
         assert len(result) == 1
-        assert result[0] == {"name": "SUPERSET_FEATURE_Y", "value": "true"}
+        assert result[0] == {"name": "SUPERSET_FEATURE_Y", "value": "True"}
+
+    def test_prefixed_feature_not_matched(self) -> None:
+        """Words like SOME_FEATURE_X=true should not match due to word boundary"""
+        result = parse_feature_flags("SOME_FEATURE_X=true")
+        assert result == []
 
     def test_all_valid_values_accepted(self) -> None:
         """All boolean-like values are accepted"""
@@ -137,7 +143,7 @@ class TestFeatureFlagsInSync:
                             expected_flags = [
                                 {
                                     "name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS",
-                                    "value": "true",
+                                    "value": "True",
                                 }
                             ]
                             mock_show.deploy_aws.assert_called_once_with(
@@ -187,7 +193,7 @@ class TestFeatureFlagsInSync:
     def test_sync_updates_flags_on_running_env(
         self, mock_get_github: Mock, mock_get_aws: Mock
     ) -> None:
-        """When env is running and flags differ from current, update is triggered"""
+        """When env is running and flags differ from current, reconcile is triggered"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
         mock_aws = Mock()
@@ -207,7 +213,7 @@ class TestFeatureFlagsInSync:
             "SUPERSET_FEATURE_ALERTS": "False",
             "SUPERSET_FEATURE_EMBEDDED": "False",
         }
-        mock_aws.update_feature_flags.return_value = True
+        mock_aws.reconcile_feature_flags.return_value = True
 
         pr = PullRequest(1234, labels)
 
@@ -216,12 +222,12 @@ class TestFeatureFlagsInSync:
         assert result.success is True
         assert result.action_taken == "no_action"
 
-        # Should have called update_feature_flags on the running env
-        mock_aws.update_feature_flags.assert_called_once_with(
+        # Should reconcile with the full desired flag set
+        mock_aws.reconcile_feature_flags.assert_called_once_with(
             "pr-1234-abc123f-service",
             {
-                "SUPERSET_FEATURE_ALERTS": True,
-                "SUPERSET_FEATURE_EMBEDDED": False,
+                "SUPERSET_FEATURE_ALERTS": "True",
+                "SUPERSET_FEATURE_EMBEDDED": "False",
             },
         )
 
@@ -255,14 +261,14 @@ class TestFeatureFlagsInSync:
 
         assert result.success is True
         assert result.action_taken == "no_action"
-        mock_aws.update_feature_flags.assert_not_called()
+        mock_aws.reconcile_feature_flags.assert_not_called()
 
     @patch("showtime.core.pull_request.get_aws")
     @patch("showtime.core.pull_request.get_github")
-    def test_sync_no_flag_update_when_no_flags(
+    def test_sync_no_flags_skips_ecs_calls(
         self, mock_get_github: Mock, mock_get_aws: Mock
     ) -> None:
-        """When env is running and no flags in description, no update call"""
+        """When PR has no flags, skip ECS API calls entirely (no unnecessary cost)"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
         mock_aws = Mock()
@@ -283,7 +289,48 @@ class TestFeatureFlagsInSync:
 
         assert result.success is True
         assert result.action_taken == "no_action"
-        mock_aws.update_feature_flags.assert_not_called()
+        # No ECS API calls when PR has no flags
+        mock_aws.get_current_feature_flags.assert_not_called()
+        mock_aws.reconcile_feature_flags.assert_not_called()
+
+    @patch("showtime.core.pull_request.get_aws")
+    @patch("showtime.core.pull_request.get_github")
+    def test_sync_removes_partial_flags(
+        self, mock_get_github: Mock, mock_get_aws: Mock
+    ) -> None:
+        """Removing one flag from PR description removes it from running env"""
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+        mock_aws = Mock()
+        mock_get_aws.return_value = mock_aws
+
+        labels = [
+            "🎪 abc123f 🚦 running",
+            "🎪 🎯 abc123f",
+        ]
+        mock_github.get_labels.return_value = labels
+        # Only ALERTS remains in description, EMBEDDED was removed
+        mock_github.get_pr_data.return_value = {
+            "body": "FEATURE_ALERTS=true"
+        }
+        # ECS still has both flags
+        mock_aws.get_current_feature_flags.return_value = {
+            "SUPERSET_FEATURE_ALERTS": "True",
+            "SUPERSET_FEATURE_EMBEDDED": "False",
+        }
+        mock_aws.reconcile_feature_flags.return_value = True
+
+        pr = PullRequest(1234, labels)
+
+        result = pr.sync("abc123f")
+
+        assert result.success is True
+        assert result.action_taken == "no_action"
+        # Should reconcile with only ALERTS — EMBEDDED will be removed
+        mock_aws.reconcile_feature_flags.assert_called_once_with(
+            "pr-1234-abc123f-service",
+            {"SUPERSET_FEATURE_ALERTS": "True"},
+        )
 
     @patch("showtime.core.pull_request.get_github")
     def test_sync_graceful_on_pr_data_failure(self, mock_get_github: Mock) -> None:
