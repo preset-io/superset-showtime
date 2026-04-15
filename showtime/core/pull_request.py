@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .aws import AWSInterface
-from .github import GitHubInterface
+from .github import GitHubInterface, is_sha_label
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -209,17 +209,15 @@ class PullRequest:
                 for SHA-containing labels to prevent orphaned label accumulation.
                 Only pass True from teardown/cleanup paths (stop, destroy).
         """
-        from .github import is_sha_label
-
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
-            github = get_github()
+            github = get_github() if delete_definitions else None
             for label in circus_labels:
                 self.remove_label(label)
                 # Delete repo-level definition for SHA-based labels (dynamic/per-env)
                 # Static trigger labels (e.g. showtime-trigger-start) are kept
-                if delete_definitions and is_sha_label(label):
+                if delete_definitions and github and is_sha_label(label):
                     github.delete_repository_label(label)
 
     def set_show_status(self, show: Show, new_status: str) -> None:
@@ -626,7 +624,7 @@ class PullRequest:
 
                 # ALWAYS remove all circus labels for stop trigger, regardless of current_show
                 if not dry_run_github:
-                    self.remove_showtime_labels(delete_definitions=True)
+                    self.remove_showtime_labels()
                     print("🏷️ GitHub labels cleaned up")
                 print("✅ Environment destroyed")
                 return SyncResult(success=True, action_taken="destroy_environment")
@@ -663,7 +661,7 @@ class PullRequest:
 
             # ALWAYS remove all circus labels for stop command, regardless of current_show
             if not kwargs.get("dry_run_github", False):
-                self.remove_showtime_labels(delete_definitions=True)
+                self.remove_showtime_labels()
                 print("🏷️ GitHub labels cleaned up")
             return SyncResult(success=True, action_taken="stopped")
         except Exception as e:
@@ -1035,7 +1033,7 @@ class PullRequest:
                 success = show.stop(dry_run_github=False, dry_run_aws=False)
                 if success:
                     # Also clean up GitHub labels for this specific show
-                    self.remove_sha_labels(show.sha, delete_definitions=True)
+                    self.remove_sha_labels(show.sha)
                     cleaned_count += 1
                     print(f"✅ Cleaned orphaned environment: {show.sha}")
                 else:
@@ -1145,19 +1143,11 @@ class PullRequest:
                 try:
                     show.stop(dry_run_github=dry_run_github, dry_run_aws=dry_run_aws)
 
-                    # Remove ONLY existing labels for this old environment (not theoretical ones)
+                    # Remove PR-level label associations for this old environment.
+                    # Repo-level definitions are left for find_orphaned_labels() to
+                    # clean up, since labels are repo-global and may be shared across PRs.
                     if not dry_run_github:
-                        existing_labels = [
-                            label
-                            for label in self.labels
-                            if label.startswith(f"🎪 {show.sha} ") or label == f"🎪 🎯 {show.sha}"
-                        ]
-                        print(f"🏷️ Removing existing labels for {show.sha}: {existing_labels}")
-                        for label in existing_labels:
-                            try:
-                                self.remove_label(label)
-                            except Exception as e:
-                                print(f"⚠️ Failed to remove label {label}: {e}")
+                        self.remove_sha_labels(show.sha)
 
                     stopped_count += 1
                     print(f"✅ Stopped environment {show.sha}")

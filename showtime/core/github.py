@@ -325,8 +325,8 @@ class GitHubInterface:
 
         except Exception as e:
             print(f"⚠️ Error during orphan detection: {e}")
-            # Fallback to old pattern-based method
-            return self.cleanup_sha_labels(dry_run)
+            print("⚠️ Skipping cleanup to avoid deleting labels that may still be in use")
+            return []
 
     def create_or_update_label(self, name: str, color: str, description: str) -> bool:
         """Create or update a label with color and description"""
