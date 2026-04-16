@@ -204,10 +204,10 @@ class GitHubInterface:
                 orphan detection since closed PRs may still have label definitions.
         """
         url = f"{self.base_url}/search/issues"
-        state_filter = "" if include_closed else "is:open "
+        state_clause = "" if include_closed else " is:open"
         items = self._paginate(
             url,
-            params={"q": f"repo:{self.org}/{self.repo} is:pr {state_filter}🎪"},
+            params={"q": f"repo:{self.org}/{self.repo} is:pr{state_clause} 🎪"},
             unwrap=lambda data: data["items"],
         )
         return [issue["number"] for issue in items]
@@ -281,52 +281,46 @@ class GitHubInterface:
         # 2. Get all labels actually used on PRs with circus labels
         print("🔍 Scanning PRs with circus labels...")
 
-        try:
-            pr_numbers = self.find_prs_with_shows(include_closed=True)
-            print(f"📋 Found {len(pr_numbers)} PRs with circus labels (open + closed)")
+        pr_numbers = self.find_prs_with_shows(include_closed=True)
+        print(f"📋 Found {len(pr_numbers)} PRs with circus labels (open + closed)")
 
-            used_labels = set()
-            for pr_number in pr_numbers:
-                pr_labels = self.get_labels(pr_number)
-                circus_labels = {label for label in pr_labels if label.startswith("🎪 ")}
-                used_labels.update(circus_labels)
+        used_labels = set()
+        for pr_number in pr_numbers:
+            pr_labels = self.get_labels(pr_number)
+            circus_labels = {label for label in pr_labels if label.startswith("🎪 ")}
+            used_labels.update(circus_labels)
 
-            print(f"📋 Found {len(used_labels)} circus labels actually used on PRs")
+        print(f"📋 Found {len(used_labels)} circus labels actually used on PRs")
 
-            # 3. Set difference to find orphaned labels
-            orphaned_labels = sha_repo_labels - used_labels
+        # 3. Set difference to find orphaned labels
+        orphaned_labels = sha_repo_labels - used_labels
 
-            print(f"🗑️ Found {len(orphaned_labels)} truly orphaned labels")
+        print(f"🗑️ Found {len(orphaned_labels)} truly orphaned labels")
 
-            # Debug: Show some examples if in dry run
-            if dry_run and orphaned_labels:
-                print("🔍 Examples of orphaned labels:")
-                for label in list(orphaned_labels)[:5]:
-                    print(f"  • {label}")
-            if dry_run and used_labels:
-                print("🔍 Examples of used labels:")
-                for label in list(used_labels)[:5]:
-                    print(f"  • {label}")
+        # Debug: Show some examples if in dry run
+        if dry_run and orphaned_labels:
+            print("🔍 Examples of orphaned labels:")
+            for label in list(orphaned_labels)[:5]:
+                print(f"  • {label}")
+        if dry_run and used_labels:
+            print("🔍 Examples of used labels:")
+            for label in list(used_labels)[:5]:
+                print(f"  • {label}")
 
-            if not dry_run and orphaned_labels:
-                deleted_labels = []
-                total = len(orphaned_labels)
-                for i, label in enumerate(orphaned_labels, 1):
-                    if self.delete_repository_label(label):
-                        deleted_labels.append(label)
-                    if i % 50 == 0:
-                        print(f"🗑️ Progress: {i}/{total} labels processed...")
-                print(
-                    f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions"
-                )
-                return deleted_labels
+        if not dry_run and orphaned_labels:
+            deleted_labels = []
+            total = len(orphaned_labels)
+            for i, label in enumerate(orphaned_labels, 1):
+                if self.delete_repository_label(label):
+                    deleted_labels.append(label)
+                if i % 50 == 0:
+                    print(f"🗑️ Progress: {i}/{total} labels processed...")
+            print(
+                f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions"
+            )
+            return deleted_labels
 
-            return list(orphaned_labels)
-
-        except Exception as e:
-            print(f"⚠️ Error during orphan detection: {e}")
-            # Fallback to old pattern-based method
-            return self.cleanup_sha_labels(dry_run)
+        return list(orphaned_labels)
 
     def create_or_update_label(self, name: str, color: str, description: str) -> bool:
         """Create or update a label with color and description"""

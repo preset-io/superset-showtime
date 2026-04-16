@@ -43,6 +43,12 @@ class TestIsShaLabel:
     def test_short_hex_not_matched(self) -> None:
         assert is_sha_label("🎪 ab12 🚦 running") is False
 
+    def test_building_pointer_label(self) -> None:
+        assert is_sha_label("🎪 🏗️ abc123f") is True
+
+    def test_empty_string(self) -> None:
+        assert is_sha_label("") is False
+
 
 class TestPaginate:
     """Tests for the _paginate helper"""
@@ -402,3 +408,135 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
 
         assert mock_github.remove_label.call_count == 1
         mock_github.delete_repository_label.assert_not_called()
+
+
+class TestPaginateBoundary:
+    """Tests for the exact-100-item pagination boundary"""
+
+    def _make_mock_client(self, mock_client: Any, responses: list) -> None:
+        mock_client.return_value.__enter__ = Mock(return_value=mock_client.return_value)
+        mock_client.return_value.__exit__ = Mock(return_value=False)
+        mock_client.return_value.get.side_effect = responses
+
+    def test_exactly_100_items_fetches_second_page(self, github: GitHubInterface) -> None:
+        """Exactly 100 results must trigger a second page fetch (may have more)"""
+        page1 = [{"name": f"label-{i}"} for i in range(100)]
+        page2: list = []  # empty → done
+
+        mock_resp1 = Mock()
+        mock_resp1.json.return_value = page1
+        mock_resp1.raise_for_status = Mock()
+
+        mock_resp2 = Mock()
+        mock_resp2.json.return_value = page2
+        mock_resp2.raise_for_status = Mock()
+
+        with patch("httpx.Client") as mock_client:
+            self._make_mock_client(mock_client, [mock_resp1, mock_resp2])
+            result = github.get_repository_labels()
+
+        assert len(result) == 100
+        assert mock_client.return_value.get.call_count == 2
+
+    def test_exactly_100_items_then_100_more(self, github: GitHubInterface) -> None:
+        """200 total items across two full pages fetches a third (empty) page"""
+        page1 = [{"name": f"label-{i}"} for i in range(100)]
+        page2 = [{"name": f"label-{i}"} for i in range(100, 200)]
+        page3: list = []
+
+        mock_resp1 = Mock()
+        mock_resp1.json.return_value = page1
+        mock_resp1.raise_for_status = Mock()
+
+        mock_resp2 = Mock()
+        mock_resp2.json.return_value = page2
+        mock_resp2.raise_for_status = Mock()
+
+        mock_resp3 = Mock()
+        mock_resp3.json.return_value = page3
+        mock_resp3.raise_for_status = Mock()
+
+        with patch("httpx.Client") as mock_client:
+            self._make_mock_client(mock_client, [mock_resp1, mock_resp2, mock_resp3])
+            result = github.get_repository_labels()
+
+        assert len(result) == 200
+        assert mock_client.return_value.get.call_count == 3
+
+
+class TestCleanupShaLabels:
+    """Tests for cleanup_sha_labels standalone entrypoint"""
+
+    def test_dry_run_returns_sha_labels_without_deleting(
+        self, github: GitHubInterface
+    ) -> None:
+        repo_labels = [
+            "🎪 abc123f 🚦 running",
+            "🎪 def456a 🌐 1.2.3.4:8080",
+            "bug",
+            "🎪 ⚡ showtime-trigger-start",
+        ]
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "delete_repository_label") as mock_delete:
+
+            result = github.cleanup_sha_labels(dry_run=True)
+
+        assert "🎪 abc123f 🚦 running" in result
+        assert "🎪 def456a 🌐 1.2.3.4:8080" in result
+        assert "bug" not in result
+        assert "🎪 ⚡ showtime-trigger-start" not in result
+        mock_delete.assert_not_called()
+
+    def test_non_dry_run_deletes_sha_labels(self, github: GitHubInterface) -> None:
+        repo_labels = ["🎪 abc123f 🚦 running", "bug"]
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(
+                 github, "delete_repository_label", return_value=True
+             ) as mock_delete:
+
+            result = github.cleanup_sha_labels(dry_run=False)
+
+        assert result == ["🎪 abc123f 🚦 running"]
+        mock_delete.assert_called_once_with("🎪 abc123f 🚦 running")
+
+    def test_skips_already_deleted_labels(self, github: GitHubInterface) -> None:
+        """delete_repository_label returning False (404) should not include in result"""
+        repo_labels = ["🎪 abc123f 🚦 running", "🎪 def456a 🚦 stopped"]
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(
+                 github, "delete_repository_label", side_effect=[True, False]
+             ):
+
+            result = github.cleanup_sha_labels(dry_run=False)
+
+        assert result == ["🎪 abc123f 🚦 running"]  # def456a was already gone
+
+
+class TestFindOrphanedLabelsErrorPropagation:
+    """Tests that find_orphaned_labels propagates errors to the caller"""
+
+    def test_propagates_api_errors(self, github: GitHubInterface) -> None:
+        """API errors must propagate so the CLI caller can report the failure"""
+        with patch.object(github, "get_repository_labels", return_value=["🎪 abc123f 🚦 running"]), \
+             patch.object(github, "find_prs_with_shows", side_effect=RuntimeError("API down")):
+
+            with pytest.raises(RuntimeError, match="API down"):
+                github.find_orphaned_labels(dry_run=True)
+
+    def test_multi_pr_orphan_detection(self, github: GitHubInterface) -> None:
+        """Labels used on any PR across multiple PRs are not orphaned"""
+        repo_labels = [
+            "🎪 abc123f 🚦 running",  # on PR #1 → not orphaned
+            "🎪 def456a 🚦 running",  # on PR #2 → not orphaned
+            "🎪 fff9999 🚦 stopped",  # on no PR → orphaned
+        ]
+        pr1_labels = ["🎪 abc123f 🚦 running"]
+        pr2_labels = ["🎪 def456a 🚦 running"]
+
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "find_prs_with_shows", return_value=[1, 2]), \
+             patch.object(github, "get_labels", side_effect=[pr1_labels, pr2_labels]):
+
+            orphaned = github.find_orphaned_labels(dry_run=True)
+
+        assert orphaned == ["🎪 fff9999 🚦 stopped"]

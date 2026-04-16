@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .aws import AWSInterface
-from .github import GitHubInterface
+from .github import GitHubInterface, is_sha_label
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -209,17 +209,15 @@ class PullRequest:
                 for SHA-containing labels to prevent orphaned label accumulation.
                 Only pass True from teardown/cleanup paths (stop, destroy).
         """
-        from .github import is_sha_label
-
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
-            github = get_github()
+            github = get_github() if delete_definitions else None
             for label in circus_labels:
                 self.remove_label(label)
                 # Delete repo-level definition for SHA-based labels (dynamic/per-env)
                 # Static trigger labels (e.g. showtime-trigger-start) are kept
-                if delete_definitions and is_sha_label(label):
+                if delete_definitions and github and is_sha_label(label):
                     github.delete_repository_label(label)
 
     def set_show_status(self, show: Show, new_status: str) -> None:
