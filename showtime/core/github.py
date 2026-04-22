@@ -6,13 +6,24 @@ and circus tent emoji state synchronization.
 """
 
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
+# SHA-containing circus label pattern: 🎪 followed by 7+ hex chars anywhere
+SHA_LABEL_PATTERN = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
+
+
+def is_sha_label(label: str) -> bool:
+    """Check if a circus tent label contains a SHA (dynamic/per-environment label)."""
+    return bool(SHA_LABEL_PATTERN.match(label))
+
 # Constants
 DEFAULT_GITHUB_ACTOR = "unknown"
+# GitHub Search API hard cap — results beyond this are silently dropped.
+SEARCH_API_MAX_RESULTS = 1000
 
 
 @dataclass
@@ -81,16 +92,47 @@ class GitHubInterface:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def get_labels(self, pr_number: int) -> List[str]:
-        """Get all labels for a PR"""
-        url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/labels"
+    def _paginate(
+        self,
+        url: str,
+        params: Optional[Dict[str, str]] = None,
+        unwrap: Optional[Callable[[Any], List[Any]]] = None,
+    ) -> List[Any]:
+        """Paginate a GitHub API list endpoint.
+
+        Args:
+            url: The API endpoint URL.
+            params: Extra query parameters (per_page/page are added automatically).
+            unwrap: Optional function to extract the list from the response JSON.
+                    Defaults to treating the response itself as the list.
+        """
+        all_items: List[Any] = []
+        page = 1
+        base_params = dict(params or {})
 
         with httpx.Client() as client:
-            response = client.get(url, headers=self.headers)
-            response.raise_for_status()
+            while True:
+                page_params = {**base_params, "per_page": "100", "page": str(page)}
+                response = client.get(url, headers=self.headers, params=page_params)
+                response.raise_for_status()
 
-            labels_data = response.json()
-            return [label["name"] for label in labels_data]
+                data = response.json()
+                items = unwrap(data) if unwrap else data
+                if not items:
+                    break
+
+                all_items.extend(items)
+
+                if len(items) < 100:
+                    break
+                page += 1
+
+        return all_items
+
+    def get_labels(self, pr_number: int) -> List[str]:
+        """Get all labels for a PR (paginated)"""
+        url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/labels"
+        return [item["name"] for item in self._paginate(url)]
 
     def add_label(self, pr_number: int, label: str) -> None:
         """Add a label to a PR (automatically creates label definition if needed)"""
@@ -156,22 +198,21 @@ class GitHubInterface:
         for label in circus_labels:
             self.remove_label(pr_number, label)
 
-    def find_prs_with_shows(self) -> List[int]:
-        """Find all PRs that have circus tent labels"""
-        # Search for issues with circus tent labels (updated for SHA-first format)
+    def find_prs_with_shows(self, include_closed: bool = False) -> List[int]:
+        """Find all PRs that have circus tent labels (paginated)
+
+        Args:
+            include_closed: If True, also search closed/merged PRs. Useful for
+                orphan detection since closed PRs may still have label definitions.
+        """
         url = f"{self.base_url}/search/issues"
-        # Search for PRs with any circus tent labels
-        params = {
-            "q": f"repo:{self.org}/{self.repo} is:pr is:open 🎪",
-            "per_page": "100",
-        }  # Only open PRs - closed PRs should have cleaned up labels
-
-        with httpx.Client() as client:
-            response = client.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-
-            issues = response.json()["items"]
-            return [issue["number"] for issue in issues]
+        state_clause = "" if include_closed else " is:open"
+        items = self._paginate(
+            url,
+            params={"q": f"repo:{self.org}/{self.repo} is:pr{state_clause} 🎪"},
+            unwrap=lambda data: data["items"],
+        )
+        return [issue["number"] for issue in items]
 
     def post_comment(self, pr_number: int, body: str) -> None:
         """Post a comment on a PR"""
@@ -193,15 +234,9 @@ class GitHubInterface:
             return False
 
     def get_repository_labels(self) -> List[str]:
-        """Get all labels defined in the repository"""
+        """Get all labels defined in the repository (paginated)"""
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/labels"
-
-        with httpx.Client() as client:
-            response = client.get(url, headers=self.headers, params={"per_page": 100})
-            response.raise_for_status()
-
-            labels_data = response.json()
-            return [label["name"] for label in labels_data]
+        return [item["name"] for item in self._paginate(url)]
 
     def delete_repository_label(self, label_name: str) -> bool:
         """Delete a label definition from the repository"""
@@ -223,17 +258,8 @@ class GitHubInterface:
 
     def cleanup_sha_labels(self, dry_run: bool = False) -> List[str]:
         """Clean up all circus tent labels with SHA patterns from repository"""
-        import re
-
         all_labels = self.get_repository_labels()
-        sha_labels = []
-
-        # Find labels with SHA patterns (7+ hex chars anywhere in label)
-        sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
-
-        for label in all_labels:
-            if sha_pattern.match(label):
-                sha_labels.append(label)
+        sha_labels = [label for label in all_labels if is_sha_label(label)]
 
         if not dry_run:
             deleted_labels = []
@@ -246,66 +272,78 @@ class GitHubInterface:
 
     def find_orphaned_labels(self, dry_run: bool = False) -> List[str]:
         """Find labels that exist in repository but aren't used on any PR"""
-        import re
-
         print("🔍 Scanning repository labels...")
 
         # 1. Get all repository labels with SHA patterns
         all_repo_labels = self.get_repository_labels()
-        sha_pattern = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
-        sha_repo_labels = {label for label in all_repo_labels if sha_pattern.match(label)}
+        sha_repo_labels = {label for label in all_repo_labels if is_sha_label(label)}
 
         print(f"📋 Found {len(sha_repo_labels)} SHA-containing labels in repository")
 
         # 2. Get all labels actually used on PRs with circus labels
         print("🔍 Scanning PRs with circus labels...")
 
-        # Import here to avoid circular import
-        import importlib
+        pr_numbers = self.find_prs_with_shows(include_closed=True)
+        print(f"📋 Found {len(pr_numbers)} PRs with circus labels (open + closed)")
 
-        pull_request_module = importlib.import_module("showtime.core.pull_request")
-        PullRequest = pull_request_module.PullRequest
+        # GitHub Search API caps results at SEARCH_API_MAX_RESULTS. If we hit that limit the PR
+        # list may be incomplete, making the "used labels" set unreliable.
+        # Deleting based on incomplete data risks removing labels still in use,
+        # so we refuse to delete and fall back to dry-run reporting.
+        search_truncated = len(pr_numbers) >= SEARCH_API_MAX_RESULTS
+        if search_truncated:
+            print(
+                f"⚠️  PR search hit the GitHub Search API {SEARCH_API_MAX_RESULTS}-result cap. "
+                "The PR list may be incomplete — skipping deletion to avoid "
+                "false positives. Use cleanup_sha_labels() for brute-force removal."
+            )
+            if not dry_run:
+                return []
+            # Dry run: skip per-PR scanning (data is unreliable anyway) and
+            # report all SHA repo labels as potential orphan candidates.
+            print(
+                f"📋 Returning all {len(sha_repo_labels)} SHA labels as "
+                "unverified candidates (PR list incomplete)"
+            )
+            return list(sha_repo_labels)
 
-        try:
-            pr_numbers = PullRequest.find_all_with_environments()
-            print(f"📋 Found {len(pr_numbers)} PRs with circus labels")
+        used_labels = set()
+        for pr_number in pr_numbers:
+            pr_labels = self.get_labels(pr_number)
+            circus_labels = {label for label in pr_labels if label.startswith("🎪 ")}
+            used_labels.update(circus_labels)
 
-            used_labels = set()
-            for pr_number in pr_numbers:
-                pr_labels = self.get_labels(pr_number)
-                circus_labels = {label for label in pr_labels if label.startswith("🎪 ")}
-                used_labels.update(circus_labels)
+        print(f"📋 Found {len(used_labels)} circus labels actually used on PRs")
 
-            print(f"📋 Found {len(used_labels)} circus labels actually used on PRs")
+        # 3. Set difference to find orphaned labels
+        orphaned_labels = sha_repo_labels - used_labels
 
-            # 3. Set difference to find orphaned labels
-            orphaned_labels = sha_repo_labels - used_labels
+        print(f"🗑️ Found {len(orphaned_labels)} truly orphaned labels")
 
-            print(f"🗑️ Found {len(orphaned_labels)} truly orphaned labels")
+        # Debug: Show some examples if in dry run
+        if dry_run and orphaned_labels:
+            print("🔍 Examples of orphaned labels:")
+            for label in list(orphaned_labels)[:5]:
+                print(f"  • {label}")
+        if dry_run and used_labels:
+            print("🔍 Examples of used labels:")
+            for label in list(used_labels)[:5]:
+                print(f"  • {label}")
 
-            # Debug: Show some examples if in dry run
-            if dry_run and orphaned_labels:
-                print("🔍 Examples of orphaned labels:")
-                for label in list(orphaned_labels)[:5]:
-                    print(f"  • {label}")
-            if dry_run and used_labels:
-                print("🔍 Examples of used labels:")
-                for label in list(used_labels)[:5]:
-                    print(f"  • {label}")
+        if not dry_run and orphaned_labels:
+            deleted_labels = []
+            total = len(orphaned_labels)
+            for i, label in enumerate(orphaned_labels, 1):
+                if self.delete_repository_label(label):
+                    deleted_labels.append(label)
+                if i % 50 == 0:
+                    print(f"🗑️ Progress: {i}/{total} labels processed...")
+            print(
+                f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions"
+            )
+            return deleted_labels
 
-            if not dry_run and orphaned_labels:
-                deleted_labels = []
-                for label in orphaned_labels:
-                    if self.delete_repository_label(label):
-                        deleted_labels.append(label)
-                return deleted_labels
-
-            return list(orphaned_labels)
-
-        except Exception as e:
-            print(f"⚠️ Error during orphan detection: {e}")
-            # Fallback to old pattern-based method
-            return self.cleanup_sha_labels(dry_run)
+        return list(orphaned_labels)
 
     def create_or_update_label(self, name: str, color: str, description: str) -> bool:
         """Create or update a label with color and description"""

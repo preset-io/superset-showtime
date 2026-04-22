@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .aws import AWSInterface
-from .github import GitHubInterface
+from .github import GitHubInterface, is_sha_label
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -187,24 +187,38 @@ class PullRequest:
         get_github().remove_label(self.pr_number, label)
         self.labels.discard(label)  # Safe - won't raise if not present
 
-    def remove_sha_labels(self, sha: str) -> None:
-        """Remove all labels for a specific SHA"""
+    def remove_sha_labels(self, sha: str, delete_definitions: bool = False) -> None:
+        """Remove all labels for a specific SHA and optionally delete repo-level definitions"""
         sha_short = sha[:7]
         labels_to_remove = [
             label for label in self.labels if label.startswith("🎪") and sha_short in label
         ]
         if labels_to_remove:
             print(f"🗑️ Removing SHA {sha_short} labels: {labels_to_remove}")
+            github = get_github() if delete_definitions else None
             for label in labels_to_remove:
                 self.remove_label(label)
+                if delete_definitions and github:
+                    github.delete_repository_label(label)
 
-    def remove_showtime_labels(self) -> None:
-        """Remove ALL circus tent labels"""
+    def remove_showtime_labels(self, delete_definitions: bool = False) -> None:
+        """Remove ALL circus tent labels from PR and optionally delete repo-level definitions.
+
+        Args:
+            delete_definitions: If True, also delete the repo-level label definitions
+                for SHA-containing labels to prevent orphaned label accumulation.
+                Only pass True from teardown/cleanup paths (stop, destroy).
+        """
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
+            github = get_github() if delete_definitions else None
             for label in circus_labels:
                 self.remove_label(label)
+                # Delete repo-level definition for SHA-based labels (dynamic/per-env)
+                # Static trigger labels (e.g. showtime-trigger-start) are kept
+                if delete_definitions and github and is_sha_label(label):
+                    github.delete_repository_label(label)
 
     def set_show_status(self, show: Show, new_status: str) -> None:
         """Atomically update show status with thorough label cleanup"""
@@ -610,7 +624,7 @@ class PullRequest:
 
                 # ALWAYS remove all circus labels for stop trigger, regardless of current_show
                 if not dry_run_github:
-                    self.remove_showtime_labels()
+                    self.remove_showtime_labels(delete_definitions=True)
                     print("🏷️ GitHub labels cleaned up")
                 print("✅ Environment destroyed")
                 return SyncResult(success=True, action_taken="destroy_environment")
@@ -647,7 +661,7 @@ class PullRequest:
 
             # ALWAYS remove all circus labels for stop command, regardless of current_show
             if not kwargs.get("dry_run_github", False):
-                self.remove_showtime_labels()
+                self.remove_showtime_labels(delete_definitions=True)
                 print("🏷️ GitHub labels cleaned up")
             return SyncResult(success=True, action_taken="stopped")
         except Exception as e:
@@ -869,8 +883,11 @@ class PullRequest:
             building_show.status = "building"
 
             # Update labels to reflect building state - only remove for this SHA
+            # Skip deleting repo-level definitions here since _update_show_labels
+            # will immediately re-create them via _ensure_label_definition_exists.
+            # Orphan cleanup sweeps handle stale definitions periodically.
             print(f"🏷️ Removing labels for SHA {target_sha[:7]}...")
-            self.remove_sha_labels(target_sha)
+            self.remove_sha_labels(target_sha, delete_definitions=False)
 
             new_labels = building_show.to_circus_labels()
             print(f"🏷️ Creating new labels: {new_labels}")
@@ -1016,7 +1033,7 @@ class PullRequest:
                 success = show.stop(dry_run_github=False, dry_run_aws=False)
                 if success:
                     # Also clean up GitHub labels for this specific show
-                    self.remove_sha_labels(show.sha)
+                    self.remove_sha_labels(show.sha, delete_definitions=True)
                     cleaned_count += 1
                     print(f"✅ Cleaned orphaned environment: {show.sha}")
                 else:
@@ -1025,9 +1042,14 @@ class PullRequest:
         return cleaned_count
 
     @classmethod
-    def find_all_with_environments(cls) -> List[int]:
-        """Find all PR numbers that have active environments"""
-        return get_github().find_prs_with_shows()
+    def find_all_with_environments(cls, include_closed: bool = False) -> List[int]:
+        """Find all PR numbers that have active environments.
+
+        Args:
+            include_closed: If True, also include closed/merged PRs. Useful for
+                orphan detection where closed PRs may still have label definitions.
+        """
+        return get_github().find_prs_with_shows(include_closed=include_closed)
 
     def _update_show_labels(self, show: Show, dry_run: bool = False) -> None:
         """Update GitHub labels to reflect show state with proper status replacement"""
