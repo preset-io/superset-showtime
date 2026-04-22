@@ -4,8 +4,9 @@
 Handles atomic transactions, trigger processing, and environment orchestration.
 """
 
+import re
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
 from .github import GitHubInterface, is_sha_label
@@ -32,6 +33,36 @@ def get_aws() -> AWSInterface:
 
 
 # Use get_github() and get_aws() directly in methods
+
+
+VALID_FLAG_VALUES = {"true", "false", "1", "0", "yes", "no"}
+
+
+def parse_feature_flags(description: Optional[str]) -> List[Dict[str, str]]:
+    """Extract feature flags from PR description.
+
+    Parses lines matching FEATURE_(name)=(value) and transforms them to
+    ECS environment variable format: [{"name": "SUPERSET_FEATURE_X", "value": "True"}]
+
+    Only accepts boolean-like values (true/false/1/0/yes/no). Invalid values are skipped.
+    Values are normalized to "True"/"False" to match the format used by reconcile_feature_flags.
+    """
+    if not description:
+        return []
+
+    flags: List[Dict[str, str]] = []
+    for match in re.finditer(r"\bFEATURE_(\w+)=(\w+)", description):
+        name = f"SUPERSET_FEATURE_{match.group(1)}"
+        value = match.group(2).lower()
+        if value not in VALID_FLAG_VALUES:
+            print(
+                f"⚠️ Skipping feature flag {name}: invalid value "
+                f"'{match.group(2)}' (expected true/false/1/0/yes/no)"
+            )
+            continue
+        canonical = "True" if value in ("true", "1", "yes") else "False"
+        flags.append({"name": name, "value": canonical})
+    return flags
 
 
 @dataclass
@@ -538,6 +569,18 @@ class PullRequest:
                 )
             print("✅ Environment claimed successfully")
 
+        # 3a. Extract feature flags from PR description
+        feature_flags: List[Dict[str, str]] = []
+        if action_needed != "destroy_environment":
+            try:
+                pr_data = get_github().get_pr_data(self.pr_number)
+                feature_flags = parse_feature_flags(pr_data.get("body"))
+                if feature_flags:
+                    flag_names = [f["name"] for f in feature_flags]
+                    print(f"🏁 Feature flags from PR description: {', '.join(flag_names)}")
+            except Exception as e:
+                print(f"⚠️ Failed to fetch PR description for feature flags: {e}")
+
         try:
             # 3. Execute action with error handling
             if action_needed == "create_environment":
@@ -553,7 +596,7 @@ class PullRequest:
                 # Phase 2: AWS deployment
                 print("☁️ Deploying to AWS ECS...")
                 self.set_show_status(show, "deploying")
-                show.deploy_aws(dry_run_aws)
+                show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
                 self.set_show_status(show, "running")
                 self.set_active_show(show)
                 print(f"✅ Deployment completed - environment running at {show.ip}:8080")
@@ -590,7 +633,7 @@ class PullRequest:
                 # Phase 2: Blue-green deployment
                 print("☁️ Deploying updated environment...")
                 self.set_show_status(new_show, "deploying")
-                new_show.deploy_aws(dry_run_aws)
+                new_show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
                 self.set_show_status(new_show, "running")
                 self.set_active_show(new_show)
                 print(f"✅ Rolling update completed - new environment at {new_show.ip}:8080")
@@ -630,6 +673,17 @@ class PullRequest:
                 return SyncResult(success=True, action_taken="destroy_environment")
 
             else:
+                # Reconcile feature flags on running environment when PR has flags.
+                # When PR description has no flags, skip the ECS API call — stale
+                # flags (if any) will be cleaned up on the next deploy.
+                if (
+                    feature_flags
+                    and self.current_show
+                    and self.current_show.status == "running"
+                ):
+                    self._update_feature_flags_if_changed(
+                        self.current_show, feature_flags, dry_run_aws
+                    )
                 return SyncResult(success=True, action_taken="no_action")
 
         except Exception as e:
@@ -914,6 +968,46 @@ class PullRequest:
             default_ttl_label = f"🎪 ⌛ {DEFAULT_TTL}"
             print(f"🏷️ Auto-creating TTL label: {default_ttl_label}")
             self.add_label(default_ttl_label)
+
+    def _update_feature_flags_if_changed(
+        self,
+        show: Show,
+        feature_flags: List[Dict[str, str]],
+        dry_run: bool = False,
+    ) -> None:
+        """Reconcile feature flags on a running environment to match PR description.
+
+        Compares desired flags (from PR description) against current ECS state
+        and updates only if they differ. Uses reconcile_feature_flags which
+        replaces the entire SUPERSET_FEATURE_* set, handling partial removals.
+
+        Note: only called when feature_flags is non-empty. Full flag removal
+        (PR description cleared of all flags) is handled on the next deploy.
+        """
+        # Build desired state: {name: "True"/"False"} matching ECS format
+        desired_flags: Dict[str, str] = {
+            f["name"]: f["value"] for f in feature_flags
+        }
+
+        if dry_run:
+            print(f"🏁 [dry-run] Would reconcile feature flags on {show.sha}")
+            return
+
+        aws = get_aws()
+
+        # Fetch current SUPERSET_FEATURE_* flags from ECS to compare
+        current_flags = aws.get_current_feature_flags(show.ecs_service_name)
+
+        if current_flags == desired_flags:
+            print(f"🏁 Feature flags on {show.sha} already match desired state, skipping update")
+            return
+
+        print(f"🏁 Reconciling feature flags on running environment {show.sha}...")
+        success = aws.reconcile_feature_flags(show.ecs_service_name, desired_flags)
+        if success:
+            print("✅ Feature flags reconciled successfully")
+        else:
+            print("⚠️ Feature flag reconciliation failed")
 
     def _create_new_show(self, target_sha: str) -> Show:
         """Create a new Show object for the target SHA"""

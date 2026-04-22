@@ -6,7 +6,7 @@ Single environment operations: Docker build, AWS deployment, state transitions.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # Import interfaces for singleton access
@@ -135,7 +135,11 @@ class Show:
         if not dry_run:
             self._build_docker_image()  # Raises on failure
 
-    def deploy_aws(self, dry_run: bool = False) -> None:
+    def deploy_aws(
+        self,
+        dry_run: bool = False,
+        feature_flags: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
         """Deploy to AWS (atomic operation)"""
         github, aws = get_interfaces()
 
@@ -144,6 +148,7 @@ class Show:
                 pr_number=self.pr_number,
                 sha=self.sha + "0" * (40 - len(self.sha)),  # Convert to full SHA
                 github_user=self.requested_by or "unknown",
+                feature_flags=feature_flags,
             )
 
             if not result.success:
