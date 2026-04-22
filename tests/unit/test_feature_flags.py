@@ -94,7 +94,7 @@ End of description"""
         assert result == []
 
     def test_all_valid_values_accepted(self) -> None:
-        """All boolean-like values are accepted"""
+        """All boolean-like values are accepted and normalized correctly"""
         description = (
             "FEATURE_A=true\nFEATURE_B=false\n"
             "FEATURE_C=1\nFEATURE_D=0\n"
@@ -102,6 +102,13 @@ End of description"""
         )
         result = parse_feature_flags(description)
         assert len(result) == 6
+        by_name = {r["name"]: r["value"] for r in result}
+        assert by_name["SUPERSET_FEATURE_A"] == "True"
+        assert by_name["SUPERSET_FEATURE_B"] == "False"
+        assert by_name["SUPERSET_FEATURE_C"] == "True"
+        assert by_name["SUPERSET_FEATURE_D"] == "False"
+        assert by_name["SUPERSET_FEATURE_E"] == "True"
+        assert by_name["SUPERSET_FEATURE_F"] == "False"
 
 
 class TestFeatureFlagsInSync:
@@ -422,3 +429,88 @@ class TestShowDeployAwsFeatureFlags:
         show.deploy_aws(dry_run=True, feature_flags=flags)
 
         assert show.ip == "52.1.2.3"
+
+
+class TestFeatureFlagSyncPaths:
+    """Tests for feature flag behavior across sync paths (dry-run, failure, destroy)"""
+
+    @patch("showtime.core.pull_request.get_aws")
+    @patch("showtime.core.pull_request.get_github")
+    def test_sync_no_action_dry_run_skips_aws(
+        self, mock_get_github: Mock, mock_get_aws: Mock
+    ) -> None:
+        """dry_run_aws=True skips ECS API calls even when flags differ"""
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+        mock_aws = Mock()
+        mock_get_aws.return_value = mock_aws
+
+        labels = [
+            "🎪 abc123f 🚦 running",
+            "🎪 🎯 abc123f",
+        ]
+        mock_github.get_labels.return_value = labels
+        mock_github.get_pr_data.return_value = {"body": "FEATURE_X=true"}
+
+        pr = PullRequest(1234, labels)
+
+        result = pr.sync("abc123f", dry_run_aws=True)
+
+        assert result.success is True
+        assert result.action_taken == "no_action"
+        # Dry-run skips ECS reads and writes
+        mock_aws.get_current_feature_flags.assert_not_called()
+        mock_aws.reconcile_feature_flags.assert_not_called()
+
+    @patch("showtime.core.pull_request.get_aws")
+    @patch("showtime.core.pull_request.get_github")
+    def test_sync_continues_when_reconcile_fails(
+        self, mock_get_github: Mock, mock_get_aws: Mock
+    ) -> None:
+        """sync() returns success even when reconcile_feature_flags returns False"""
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+        mock_aws = Mock()
+        mock_get_aws.return_value = mock_aws
+
+        labels = [
+            "🎪 abc123f 🚦 running",
+            "🎪 🎯 abc123f",
+        ]
+        mock_github.get_labels.return_value = labels
+        mock_github.get_pr_data.return_value = {"body": "FEATURE_X=true"}
+        mock_aws.get_current_feature_flags.return_value = {}
+        mock_aws.reconcile_feature_flags.return_value = False  # ECS update fails
+
+        pr = PullRequest(1234, labels)
+
+        result = pr.sync("abc123f")
+
+        # Reconcile failure is non-fatal — sync still reports success
+        assert result.success is True
+        assert result.action_taken == "no_action"
+        mock_aws.reconcile_feature_flags.assert_called_once_with(
+            "pr-1234-abc123f-service",
+            {"SUPERSET_FEATURE_X": "True"},
+        )
+
+    @patch("showtime.core.pull_request.get_aws")
+    @patch("showtime.core.pull_request.get_github")
+    def test_sync_destroy_skips_pr_data_fetch(
+        self, mock_get_github: Mock, mock_get_aws: Mock
+    ) -> None:
+        """destroy_environment path does not fetch PR data for feature flags"""
+        mock_github = Mock()
+        mock_get_github.return_value = mock_github
+
+        # Stop trigger with no current environment (simpler — avoids mocking Show.stop)
+        labels = ["🎪 🛑 showtime-trigger-stop"]
+        mock_github.get_labels.return_value = labels
+
+        pr = PullRequest(1234, labels)
+
+        with patch.object(pr, "_atomic_claim", return_value=True):
+            result = pr.sync("abc123f", dry_run_github=True, dry_run_aws=True)
+
+        assert result.action_taken == "destroy_environment"
+        mock_github.get_pr_data.assert_not_called()
