@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from showtime.core.github import GitHubInterface, is_sha_label
+from showtime.core.github import SEARCH_API_MAX_RESULTS, GitHubInterface, is_sha_label
 
 
 @pytest.fixture
@@ -540,3 +540,77 @@ class TestFindOrphanedLabelsErrorPropagation:
             orphaned = github.find_orphaned_labels(dry_run=True)
 
         assert orphaned == ["🎪 fff9999 🚦 stopped"]
+
+
+class TestFindOrphanedLabelsSearchTruncation:
+    """Tests for GitHub Search API 1000-result cap safety guard"""
+
+    def test_skips_deletion_when_search_truncated(
+        self, github: GitHubInterface, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When ≥1000 PRs returned, refuse to delete — PR list may be incomplete"""
+        repo_labels = ["🎪 abc123f 🚦 running"]
+        pr_numbers = list(range(1, 1001))  # exactly 1000 → may be truncated
+
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
+             patch.object(github, "delete_repository_label") as mock_delete:
+
+            result = github.find_orphaned_labels(dry_run=False)
+
+        # Must NOT delete anything — we can't be sure the list is complete
+        mock_delete.assert_not_called()
+        assert result == []
+        assert f"{SEARCH_API_MAX_RESULTS}-result cap" in capsys.readouterr().out
+
+    def test_dry_run_returns_candidates_without_scanning_prs(
+        self, github: GitHubInterface, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Dry run with ≥1000 PRs should return repo SHA labels without per-PR scanning"""
+        repo_labels = ["🎪 abc123f 🚦 running", "bug"]
+        pr_numbers = list(range(1, 1001))
+
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
+             patch.object(github, "get_labels") as mock_get_labels, \
+             patch.object(github, "delete_repository_label") as mock_delete:
+
+            result = github.find_orphaned_labels(dry_run=True)
+
+        # Should return SHA repo labels as candidates without calling get_labels
+        assert "🎪 abc123f 🚦 running" in result
+        assert "bug" not in result
+        mock_get_labels.assert_not_called()
+        mock_delete.assert_not_called()
+        output = capsys.readouterr().out
+        assert f"{SEARCH_API_MAX_RESULTS}-result cap" in output
+        assert "unverified candidates" in output
+
+    def test_proceeds_normally_under_threshold(self, github: GitHubInterface) -> None:
+        """When <1000 PRs returned, proceed with deletion normally"""
+        repo_labels = ["🎪 abc123f 🚦 running"]
+
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "find_prs_with_shows", return_value=[1, 2, 3]), \
+             patch.object(github, "get_labels", return_value=[]), \
+             patch.object(github, "delete_repository_label", return_value=True) as mock_delete:
+
+            result = github.find_orphaned_labels(dry_run=False)
+
+        assert len(result) == 1
+        mock_delete.assert_called_once()
+
+    def test_999_prs_proceeds_normally(self, github: GitHubInterface) -> None:
+        """Boundary: 999 PRs is just under the cap — should proceed with normal deletion"""
+        repo_labels = ["🎪 abc123f 🚦 running"]
+        pr_numbers = list(range(1, 1000))  # 999 PRs → below threshold
+
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
+             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
+             patch.object(github, "get_labels", return_value=[]), \
+             patch.object(github, "delete_repository_label", return_value=True) as mock_delete:
+
+            result = github.find_orphaned_labels(dry_run=False)
+
+        assert len(result) == 1
+        mock_delete.assert_called_once()

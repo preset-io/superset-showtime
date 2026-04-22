@@ -22,6 +22,8 @@ def is_sha_label(label: str) -> bool:
 
 # Constants
 DEFAULT_GITHUB_ACTOR = "unknown"
+# GitHub Search API hard cap — results beyond this are silently dropped.
+SEARCH_API_MAX_RESULTS = 1000
 
 
 @dataclass
@@ -283,6 +285,27 @@ class GitHubInterface:
 
         pr_numbers = self.find_prs_with_shows(include_closed=True)
         print(f"📋 Found {len(pr_numbers)} PRs with circus labels (open + closed)")
+
+        # GitHub Search API caps results at SEARCH_API_MAX_RESULTS. If we hit that limit the PR
+        # list may be incomplete, making the "used labels" set unreliable.
+        # Deleting based on incomplete data risks removing labels still in use,
+        # so we refuse to delete and fall back to dry-run reporting.
+        search_truncated = len(pr_numbers) >= SEARCH_API_MAX_RESULTS
+        if search_truncated:
+            print(
+                f"⚠️  PR search hit the GitHub Search API {SEARCH_API_MAX_RESULTS}-result cap. "
+                "The PR list may be incomplete — skipping deletion to avoid "
+                "false positives. Use cleanup_sha_labels() for brute-force removal."
+            )
+            if not dry_run:
+                return []
+            # Dry run: skip per-PR scanning (data is unreliable anyway) and
+            # report all SHA repo labels as potential orphan candidates.
+            print(
+                f"📋 Returning all {len(sha_repo_labels)} SHA labels as "
+                "unverified candidates (PR list incomplete)"
+            )
+            return list(sha_repo_labels)
 
         used_labels = set()
         for pr_number in pr_numbers:
