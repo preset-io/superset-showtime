@@ -203,7 +203,11 @@ class TestFindPrsWithShows:
         assert result == [1, 2]
         # Verify query does NOT contain "is:open"
         call_kwargs = mock_client.return_value.get.call_args
-        query = call_kwargs.kwargs["params"]["q"] if "params" in call_kwargs.kwargs else call_kwargs[1]["params"]["q"]
+        query = (
+            call_kwargs.kwargs["params"]["q"]
+            if "params" in call_kwargs.kwargs
+            else call_kwargs[1]["params"]["q"]
+        )
         assert "is:open" not in query
 
     def test_default_only_open_prs(self, github: GitHubInterface) -> None:
@@ -221,7 +225,11 @@ class TestFindPrsWithShows:
 
         assert result == [1]
         call_kwargs = mock_client.return_value.get.call_args
-        query = call_kwargs.kwargs["params"]["q"] if "params" in call_kwargs.kwargs else call_kwargs[1]["params"]["q"]
+        query = (
+            call_kwargs.kwargs["params"]["q"]
+            if "params" in call_kwargs.kwargs
+            else call_kwargs[1]["params"]["q"]
+        )
         assert "is:open" in query
 
     def test_pagination(self, github: GitHubInterface) -> None:
@@ -263,10 +271,9 @@ class TestFindOrphanedLabels:
 
         pr1_labels = ["🎪 xyz789b 🚦 running", "🎪 🎯 xyz789b", "bug"]
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=[1]), \
-             patch.object(github, "get_labels", return_value=pr1_labels):
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=[1]
+        ), patch.object(github, "get_labels", return_value=pr1_labels):
             orphaned = github.find_orphaned_labels(dry_run=True)
 
         assert len(orphaned) == 2
@@ -278,10 +285,9 @@ class TestFindOrphanedLabels:
         repo_labels = ["🎪 abc123f 🚦 running", "bug"]
         pr_labels = ["🎪 abc123f 🚦 running", "bug"]
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=[1]), \
-             patch.object(github, "get_labels", return_value=pr_labels):
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=[1]
+        ), patch.object(github, "get_labels", return_value=pr_labels):
             orphaned = github.find_orphaned_labels(dry_run=True)
 
         assert len(orphaned) == 0
@@ -290,11 +296,11 @@ class TestFindOrphanedLabels:
         """Non-dry-run should delete orphaned labels"""
         repo_labels = ["🎪 abc123f 🚦 running", "🎪 def456a 🌐 1.2.3.4:8080"]
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=[]), \
-             patch.object(github, "get_labels", return_value=[]), \
-             patch.object(github, "delete_repository_label", return_value=True) as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=[]
+        ), patch.object(github, "get_labels", return_value=[]), patch.object(
+            github, "delete_repository_label", return_value=True
+        ) as mock_delete:
             deleted = github.find_orphaned_labels(dry_run=False)
 
         assert len(deleted) == 2
@@ -302,10 +308,9 @@ class TestFindOrphanedLabels:
 
     def test_searches_closed_prs(self, github: GitHubInterface) -> None:
         """Orphan detection should include closed PRs"""
-        with patch.object(github, "get_repository_labels", return_value=[]), \
-             patch.object(github, "find_prs_with_shows", return_value=[]) as mock_find, \
-             patch.object(github, "get_labels", return_value=[]):
-
+        with patch.object(github, "get_repository_labels", return_value=[]), patch.object(
+            github, "find_prs_with_shows", return_value=[]
+        ) as mock_find, patch.object(github, "get_labels", return_value=[]):
             github.find_orphaned_labels(dry_run=True)
 
         mock_find.assert_called_once_with(include_closed=True)
@@ -467,18 +472,16 @@ class TestPaginateBoundary:
 class TestCleanupShaLabels:
     """Tests for cleanup_sha_labels standalone entrypoint"""
 
-    def test_dry_run_returns_sha_labels_without_deleting(
-        self, github: GitHubInterface
-    ) -> None:
+    def test_dry_run_returns_sha_labels_without_deleting(self, github: GitHubInterface) -> None:
         repo_labels = [
             "🎪 abc123f 🚦 running",
             "🎪 def456a 🌐 1.2.3.4:8080",
             "bug",
             "🎪 ⚡ showtime-trigger-start",
         ]
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "delete_repository_label") as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "delete_repository_label"
+        ) as mock_delete:
             result = github.cleanup_sha_labels(dry_run=True)
 
         assert "🎪 abc123f 🚦 running" in result
@@ -489,11 +492,9 @@ class TestCleanupShaLabels:
 
     def test_non_dry_run_deletes_sha_labels(self, github: GitHubInterface) -> None:
         repo_labels = ["🎪 abc123f 🚦 running", "bug"]
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(
-                 github, "delete_repository_label", return_value=True
-             ) as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "delete_repository_label", return_value=True
+        ) as mock_delete:
             result = github.cleanup_sha_labels(dry_run=False)
 
         assert result == ["🎪 abc123f 🚦 running"]
@@ -502,11 +503,9 @@ class TestCleanupShaLabels:
     def test_skips_already_deleted_labels(self, github: GitHubInterface) -> None:
         """delete_repository_label returning False (404) should not include in result"""
         repo_labels = ["🎪 abc123f 🚦 running", "🎪 def456a 🚦 stopped"]
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(
-                 github, "delete_repository_label", side_effect=[True, False]
-             ):
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "delete_repository_label", side_effect=[True, False]
+        ):
             result = github.cleanup_sha_labels(dry_run=False)
 
         assert result == ["🎪 abc123f 🚦 running"]  # def456a was already gone
@@ -517,9 +516,9 @@ class TestFindOrphanedLabelsErrorPropagation:
 
     def test_propagates_api_errors(self, github: GitHubInterface) -> None:
         """API errors must propagate so the CLI caller can report the failure"""
-        with patch.object(github, "get_repository_labels", return_value=["🎪 abc123f 🚦 running"]), \
-             patch.object(github, "find_prs_with_shows", side_effect=RuntimeError("API down")):
-
+        with patch.object(
+            github, "get_repository_labels", return_value=["🎪 abc123f 🚦 running"]
+        ), patch.object(github, "find_prs_with_shows", side_effect=RuntimeError("API down")):
             with pytest.raises(RuntimeError, match="API down"):
                 github.find_orphaned_labels(dry_run=True)
 
@@ -533,10 +532,9 @@ class TestFindOrphanedLabelsErrorPropagation:
         pr1_labels = ["🎪 abc123f 🚦 running"]
         pr2_labels = ["🎪 def456a 🚦 running"]
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=[1, 2]), \
-             patch.object(github, "get_labels", side_effect=[pr1_labels, pr2_labels]):
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=[1, 2]
+        ), patch.object(github, "get_labels", side_effect=[pr1_labels, pr2_labels]):
             orphaned = github.find_orphaned_labels(dry_run=True)
 
         assert orphaned == ["🎪 fff9999 🚦 stopped"]
@@ -552,10 +550,9 @@ class TestFindOrphanedLabelsSearchTruncation:
         repo_labels = ["🎪 abc123f 🚦 running"]
         pr_numbers = list(range(1, 1001))  # exactly 1000 → may be truncated
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
-             patch.object(github, "delete_repository_label") as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=pr_numbers
+        ), patch.object(github, "delete_repository_label") as mock_delete:
             result = github.find_orphaned_labels(dry_run=False)
 
         # Must NOT delete anything — we can't be sure the list is complete
@@ -570,11 +567,11 @@ class TestFindOrphanedLabelsSearchTruncation:
         repo_labels = ["🎪 abc123f 🚦 running", "bug"]
         pr_numbers = list(range(1, 1001))
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
-             patch.object(github, "get_labels") as mock_get_labels, \
-             patch.object(github, "delete_repository_label") as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=pr_numbers
+        ), patch.object(github, "get_labels") as mock_get_labels, patch.object(
+            github, "delete_repository_label"
+        ) as mock_delete:
             result = github.find_orphaned_labels(dry_run=True)
 
         # Should return SHA repo labels as candidates without calling get_labels
@@ -590,11 +587,11 @@ class TestFindOrphanedLabelsSearchTruncation:
         """When <1000 PRs returned, proceed with deletion normally"""
         repo_labels = ["🎪 abc123f 🚦 running"]
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=[1, 2, 3]), \
-             patch.object(github, "get_labels", return_value=[]), \
-             patch.object(github, "delete_repository_label", return_value=True) as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=[1, 2, 3]
+        ), patch.object(github, "get_labels", return_value=[]), patch.object(
+            github, "delete_repository_label", return_value=True
+        ) as mock_delete:
             result = github.find_orphaned_labels(dry_run=False)
 
         assert len(result) == 1
@@ -605,12 +602,114 @@ class TestFindOrphanedLabelsSearchTruncation:
         repo_labels = ["🎪 abc123f 🚦 running"]
         pr_numbers = list(range(1, 1000))  # 999 PRs → below threshold
 
-        with patch.object(github, "get_repository_labels", return_value=repo_labels), \
-             patch.object(github, "find_prs_with_shows", return_value=pr_numbers), \
-             patch.object(github, "get_labels", return_value=[]), \
-             patch.object(github, "delete_repository_label", return_value=True) as mock_delete:
-
+        with patch.object(github, "get_repository_labels", return_value=repo_labels), patch.object(
+            github, "find_prs_with_shows", return_value=pr_numbers
+        ), patch.object(github, "get_labels", return_value=[]), patch.object(
+            github, "delete_repository_label", return_value=True
+        ) as mock_delete:
             result = github.find_orphaned_labels(dry_run=False)
 
         assert len(result) == 1
         mock_delete.assert_called_once()
+
+
+class TestFindUnattachedShaLabels:
+    """Tests for GraphQL attachment-count based label pruning."""
+
+    @staticmethod
+    def _label(name: str, issues: int = 0, prs: int = 0) -> dict:
+        return {
+            "name": name,
+            "issues": {"totalCount": issues},
+            "pullRequests": {"totalCount": prs},
+        }
+
+    def test_dry_run_uses_attachment_counts_and_preserves_controls(
+        self, github: GitHubInterface
+    ) -> None:
+        page = {
+            "repository": {
+                "labels": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        self._label("🎪 abc123f 🚦 running"),  # orphan
+                        self._label("🎪 def456a 🌐 1.2.3.4:8080", prs=1),  # in use
+                        self._label("🎪 1112223 📅 2024-01-15T14-30", issues=1),  # in use
+                        self._label("🎪 ⚡ showtime-trigger-start"),  # control
+                        self._label("🎪 ⌛ 1w"),  # control
+                        self._label("bug"),
+                    ],
+                }
+            }
+        }
+
+        with patch.object(github, "_graphql", return_value=page) as mock_graphql, patch.object(
+            github, "delete_repository_label"
+        ) as mock_delete:
+            result = github.find_unattached_sha_labels(dry_run=True)
+
+        assert result == ["🎪 abc123f 🚦 running"]
+        mock_delete.assert_not_called()
+        mock_graphql.assert_called_once()
+
+    def test_deletes_only_unattached_sha_labels(self, github: GitHubInterface) -> None:
+        page = {
+            "repository": {
+                "labels": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        self._label("🎪 abc123f 🚦 running"),
+                        self._label("🎪 def456a 🚦 running"),
+                        self._label("🎪 fedcba9 🚦 running", prs=1),
+                    ],
+                }
+            }
+        }
+
+        with patch.object(github, "_graphql", return_value=page), patch.object(
+            github, "delete_repository_label", side_effect=[True, False]
+        ) as mock_delete:
+            result = github.find_unattached_sha_labels(dry_run=False)
+
+        assert result == ["🎪 abc123f 🚦 running"]
+        delete_calls = [c.args[0] for c in mock_delete.call_args_list]
+        assert delete_calls == ["🎪 abc123f 🚦 running", "🎪 def456a 🚦 running"]
+
+    def test_paginates_graphql_labels(self, github: GitHubInterface) -> None:
+        page1 = {
+            "repository": {
+                "labels": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                    "nodes": [self._label("🎪 def456a 🚦 running")],
+                }
+            }
+        }
+        page2 = {
+            "repository": {
+                "labels": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [self._label("🎪 abc123f 🚦 running")],
+                }
+            }
+        }
+
+        with patch.object(github, "_graphql", side_effect=[page1, page2]) as mock_graphql:
+            result = github.find_unattached_sha_labels(dry_run=True)
+
+        assert result == ["🎪 abc123f 🚦 running", "🎪 def456a 🚦 running"]
+        assert mock_graphql.call_count == 2
+        assert mock_graphql.call_args_list[0].args[1]["cursor"] is None
+        assert mock_graphql.call_args_list[1].args[1]["cursor"] == "cursor-1"
+
+    def test_graphql_errors_are_reported(self, github: GitHubInterface) -> None:
+        mock_response = Mock()
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {"errors": [{"message": "bad query"}]}
+
+        with patch("httpx.Client") as mock_client:
+            mock_client.return_value.__enter__ = Mock(return_value=mock_client.return_value)
+            mock_client.return_value.__exit__ = Mock(return_value=False)
+            mock_client.return_value.post.return_value = mock_response
+
+            with pytest.raises(Exception, match="bad query"):
+                github.find_unattached_sha_labels(dry_run=True)

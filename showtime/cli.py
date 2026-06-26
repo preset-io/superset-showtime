@@ -62,6 +62,112 @@ console = Console()
 p = console.print  # Shorthand for cleaner code
 
 
+def _cleanup_repository_labels(
+    github: GitHubInterface, dry_run: bool, force: bool, limit: Optional[int] = None
+) -> int:
+    """Clean unattached per-SHA repository label definitions safely."""
+    p("\n🏷️ [bold blue]Scanning for orphaned repository labels...[/bold blue]")
+    orphaned_labels = github.find_unattached_sha_labels(dry_run=True, limit=limit)
+
+    if not orphaned_labels:
+        p("🏷️ No orphaned repository labels found")
+        return 0
+
+    limit_suffix = " for this batch" if limit is not None else ""
+    p(f"🏷️ Found {len(orphaned_labels)} orphaned repository labels{limit_suffix}:")
+    for label in orphaned_labels[:3]:
+        p(f"  • {label}")
+    if len(orphaned_labels) > 3:
+        p(f"  ... and {len(orphaned_labels) - 3} more")
+
+    if dry_run:
+        p("🏷️ [bold yellow]DRY RUN[/bold yellow] - no repository labels deleted")
+        return len(orphaned_labels)
+
+    if not force and not typer.confirm(
+        f"Delete {len(orphaned_labels)} unattached SHA-based showtime labels from repository?"
+    ):
+        p("❌ Skipping repository label cleanup")
+        return 0
+
+    deleted_labels = []
+    total = len(orphaned_labels)
+    for i, label in enumerate(orphaned_labels, 1):
+        if github.delete_repository_label(label):
+            deleted_labels.append(label)
+        if i % 50 == 0:
+            p(f"🗑️ Progress: {i}/{total} labels processed...")
+
+    deleted_count = len(deleted_labels)
+    if deleted_count > 0:
+        p(f"🏷️ ✅ Cleaned up {deleted_count} orphaned repository labels")
+        try:
+            remaining = github.find_unattached_sha_labels(dry_run=True, limit=1)
+        except Exception as e:
+            p(f"⚠️ Post-delete validation scan failed: {e}")
+        else:
+            if remaining:
+                p(
+                    "🏷️ Post-delete validation: orphaned labels remain (run another batch to continue)"
+                )
+            else:
+                p("🏷️ Post-delete validation: no orphaned repository labels remain")
+    else:
+        p("🏷️ No repository labels were deleted")
+    return deleted_count
+
+
+def _cleanup_closed_pr_labels(dry_run: bool, force: bool) -> int:
+    """Remove Showtime labels from closed PRs missed by the close-event workflow."""
+    p("\n🔒 [bold blue]Scanning closed PRs for stale Showtime labels...[/bold blue]")
+    from .core.pull_request import get_github
+
+    github = get_github()
+    closed_prs = []
+
+    for pr_number in PullRequest.find_all_with_environments(include_closed=True):
+        try:
+            pr_data = PullRequest.from_id(pr_number)
+            if not pr_data.circus_labels:
+                continue
+            state = github.get_pr_data(pr_number).get("state", "open")
+            if state == "closed":
+                closed_prs.append(pr_data)
+        except Exception as e:
+            p(f"⚠️ Failed to inspect PR #{pr_number}: {e}")
+
+    if not closed_prs:
+        p("🔒 No closed PRs with stale Showtime labels found")
+        return 0
+
+    p(f"🔒 Found {len(closed_prs)} closed PRs with Showtime labels")
+    for pr in closed_prs[:5]:
+        p(f"  • PR #{pr.pr_number}: {len(pr.circus_labels)} Showtime labels")
+    if len(closed_prs) > 5:
+        p(f"  ... and {len(closed_prs) - 5} more")
+
+    if dry_run:
+        p("🔒 [bold yellow]DRY RUN[/bold yellow] - no closed PR labels removed")
+        return len(closed_prs)
+
+    if not force and not typer.confirm(
+        f"Remove Showtime labels from {len(closed_prs)} closed PRs?"
+    ):
+        p("❌ Skipping closed PR label cleanup")
+        return 0
+
+    cleaned_count = 0
+    for pr in closed_prs:
+        result = pr.stop_environment(dry_run_github=False, dry_run_aws=False)
+        if result.success:
+            cleaned_count += 1
+        else:
+            p(f"⚠️ Failed to clean PR #{pr.pr_number}: {result.error}")
+
+    p(f"🔒 ✅ Cleaned Showtime labels from {cleaned_count}/{len(closed_prs)} closed PRs")
+    return cleaned_count
+
+
 def _get_github_workflow_url() -> str:
     """Get current GitHub Actions workflow URL"""
     import os
@@ -577,19 +683,18 @@ def sync(
         # Execution mode - do the sync
         p(f"🎪 [bold blue]Syncing PR #{pr_number}[/bold blue] (SHA: {target_sha[:7]})")
 
-        # Handle closed PRs specially
+        # Handle closed PRs specially. Always call stop_environment(), even
+        # when there is no active pointer: older/failed/orphaned Showtime labels
+        # on closed PRs still need to be removed so their repo definitions can be pruned.
         if pr_state == "closed":
-            p("🎪 PR is closed - cleaning up environment")
-            if pr.current_show:
-                stop_result = pr.stop_environment(
-                    dry_run_github=dry_run_github, dry_run_aws=dry_run_aws
-                )
-                if stop_result.success:
-                    p("🎪 ✅ Cleanup completed")
-                else:
-                    p(f"🎪 ❌ Cleanup failed: {stop_result.error}")
+            p("🎪 PR is closed - cleaning up environment and labels")
+            stop_result = pr.stop_environment(
+                dry_run_github=dry_run_github, dry_run_aws=dry_run_aws
+            )
+            if stop_result.success:
+                p("🎪 ✅ Cleanup completed")
             else:
-                p("🎪 No environment to clean up")
+                p(f"🎪 ❌ Cleanup failed: {stop_result.error}")
             return
 
         # Regular sync for open PRs
@@ -662,6 +767,35 @@ def setup_labels(
         p(f"🎪 [bold red]Error setting up labels:[/bold red] {e}")
 
 
+@app.command("cleanup-labels")
+def cleanup_labels_command(
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--no-dry-run", help="Preview deletions by default"
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Skip interactive confirmation when deleting"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum number of labels to delete/list in this run"
+    ),
+) -> None:
+    """🎪 Prune unattached per-SHA Showtime label definitions from the repository.
+
+    This is safe for daily GitHub Actions usage: only 🎪 labels containing a git
+    SHA and attached to zero issues and zero PRs are candidates. Persistent
+    control labels such as triggers, TTLs, freeze, and blocked labels do not
+    contain SHAs and are preserved.
+    """
+    try:
+        github = GitHubInterface()
+        deleted_or_candidate_count = _cleanup_repository_labels(github, dry_run, force, limit)
+        if dry_run and deleted_or_candidate_count > 0:
+            p("\n💡 Re-run with --no-dry-run --force to delete these labels non-interactively")
+    except Exception as e:
+        p(f"❌ Repository label cleanup failed: {e}")
+        raise typer.Exit(1) from e
+
+
 @app.command()
 def cleanup(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be cleaned"),
@@ -684,6 +818,14 @@ def cleanup(
         True,
         "--cleanup-aws-orphans/--no-cleanup-aws-orphans",
         help="Also cleanup orphaned AWS resources",
+    ),
+    label_limit: Optional[int] = typer.Option(
+        None, "--label-limit", min=1, help="Maximum number of repository labels to delete/list"
+    ),
+    cleanup_closed_pr_labels: bool = typer.Option(
+        True,
+        "--cleanup-closed-pr-labels/--no-cleanup-closed-pr-labels",
+        help="Also remove Showtime labels from closed PRs missed by close-event cleanup",
     ),
 ) -> None:
     """🎪 Clean up orphaned or expired environments and labels"""
@@ -720,13 +862,16 @@ def cleanup(
             if max_age_cap_hours:
                 p(f"   (with max age cap of {max_age_cap_hours}h)")
         else:
-            p(f"🎪 [bold blue]Cleaning environments older than {default_max_age_hours}h...[/bold blue]")
+            p(
+                f"🎪 [bold blue]Cleaning environments older than {default_max_age_hours}h...[/bold blue]"
+            )
 
-        # Get all PRs with environments
+        # Get all PRs with environments. Even if there are no active PR labels,
+        # continue to the later phases: repository-level label definitions can
+        # still be orphaned after prior daily operations removed them from PRs.
         pr_numbers = PullRequest.find_all_with_environments()
         if not pr_numbers:
             p("🎪 No environments found to clean")
-            return
 
         cleaned_count = 0
         orphan_cleaned_count = 0
@@ -751,7 +896,9 @@ def cleanup(
                             continue
                         else:
                             # Invalid/unparsable TTL label - warn and use default
-                            p(f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h")
+                            p(
+                                f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h"
+                            )
                             effective_max_age = default_max_age_hours
                     else:
                         # No TTL label - use default
@@ -846,50 +993,33 @@ def cleanup(
             except Exception as e:
                 p(f"⚠️ AWS orphan scan failed: {e}")
 
-        # Phase 3: Repository label cleanup
+        # Phase 3: Closed PR label cleanup
+        closed_pr_cleaned_count = 0
+        if cleanup_closed_pr_labels:
+            try:
+                closed_pr_cleaned_count = _cleanup_closed_pr_labels(dry_run, force)
+            except Exception as e:
+                p(f"⚠️ Closed PR label cleanup failed: {e}")
+
+        # Phase 4: Repository label cleanup
         label_cleaned_count = 0
         if cleanup_labels:
             from .core.pull_request import get_github
 
-            p("\n🏷️ [bold blue]Scanning for orphaned repository labels...[/bold blue]")
-            github = get_github()
-
             try:
-                orphaned_labels = github.find_orphaned_labels(dry_run=True)  # Preview
-
-                if orphaned_labels:
-                    p(f"🏷️ Found {len(orphaned_labels)} orphaned repository labels:")
-                    for label in orphaned_labels[:3]:
-                        p(f"  • {label}")
-                    if len(orphaned_labels) > 3:
-                        p(f"  ... and {len(orphaned_labels) - 3} more")
-
-                    if not force and not dry_run:
-                        if typer.confirm(
-                            f"Delete {len(orphaned_labels)} orphaned labels from repository?"
-                        ):
-                            deleted_labels = github.find_orphaned_labels(dry_run=False)
-                            label_cleaned_count = len(deleted_labels)
-                        else:
-                            p("❌ Skipping repository label cleanup")
-                    elif force or dry_run:
-                        label_cleaned_count = len(orphaned_labels)
-                        if not dry_run:
-                            github.find_orphaned_labels(dry_run=False)
-
-                if label_cleaned_count > 0:
-                    p(f"🏷️ ✅ Cleaned up {label_cleaned_count} orphaned repository labels")
-                else:
-                    p("🏷️ No orphaned repository labels found")
-
+                label_cleaned_count = _cleanup_repository_labels(
+                    get_github(), dry_run, force, label_limit
+                )
             except Exception as e:
                 p(f"⚠️ Repository label scan failed: {e}")
 
         # Final summary
-        total_cleaned = cleaned_count + aws_cleaned_count + label_cleaned_count
+        total_cleaned = (
+            cleaned_count + aws_cleaned_count + closed_pr_cleaned_count + label_cleaned_count
+        )
         if total_cleaned > 0:
             p(
-                f"\n🎉 [bold green]Total cleanup: {cleaned_count} environments + {aws_cleaned_count} AWS orphans + {label_cleaned_count} labels[/bold green]"
+                f"\n🎉 [bold green]Total cleanup: {cleaned_count} environments + {aws_cleaned_count} AWS orphans + {closed_pr_cleaned_count} closed PRs + {label_cleaned_count} labels[/bold green]"
             )
         else:
             p("\n✨ [bold green]No cleanup needed - everything is clean![/bold green]")

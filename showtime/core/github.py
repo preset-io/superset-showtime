@@ -20,6 +20,7 @@ def is_sha_label(label: str) -> bool:
     """Check if a circus tent label contains a SHA (dynamic/per-environment label)."""
     return bool(SHA_LABEL_PATTERN.match(label))
 
+
 # Constants
 DEFAULT_GITHUB_ACTOR = "unknown"
 # GitHub Search API hard cap — results beyond this are silently dropped.
@@ -128,6 +129,47 @@ class GitHubInterface:
                 page += 1
 
         return all_items
+
+    def _graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run a GitHub GraphQL query and return the data payload."""
+        import time
+
+        url = "https://api.github.com/graphql"
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, 4):
+            try:
+                with httpx.Client(timeout=60.0) as client:
+                    response = client.post(
+                        url,
+                        headers=self.headers,
+                        json={"query": query, "variables": variables or {}},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+
+                errors = payload.get("errors")
+                if errors:
+                    messages = "; ".join(str(error.get("message", error)) for error in errors)
+                    raise GitHubError(f"GitHub GraphQL error: {messages}")
+
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    raise GitHubError("GitHub GraphQL response did not include a data object")
+                return data
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+                last_error = e
+                status_code = (
+                    e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+                )
+                if attempt == 3 or (status_code is not None and status_code < 500):
+                    raise
+                print(f"⚠️ GitHub GraphQL request failed ({e}); retrying in {attempt * 2}s...")
+                time.sleep(attempt * 2)
+
+        if last_error:
+            raise last_error
+        raise GitHubError("GitHub GraphQL request failed")
 
     def get_labels(self, pr_number: int) -> List[str]:
         """Get all labels for a PR (paginated)"""
@@ -338,12 +380,94 @@ class GitHubInterface:
                     deleted_labels.append(label)
                 if i % 50 == 0:
                     print(f"🗑️ Progress: {i}/{total} labels processed...")
-            print(
-                f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions"
-            )
+            print(f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions")
             return deleted_labels
 
         return list(orphaned_labels)
+
+    def find_unattached_sha_labels(
+        self, dry_run: bool = False, limit: Optional[int] = None
+    ) -> List[str]:
+        """Find/delete SHA-based circus label definitions with zero attachments.
+
+        This uses GitHub GraphQL label attachment counts instead of issue search.
+        The search API is capped at 1000 results in large repositories such as
+        apache/superset, which makes search-based orphan detection either unsafe
+        or unable to delete anything. A label is considered safe to prune only
+        when GitHub reports that it is attached to zero issues and zero PRs.
+        """
+        print("🔍 Scanning repository labels with attachment counts...")
+
+        query = """
+        query($owner: String!, $repo: String!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            labels(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                name
+                issues { totalCount }
+                pullRequests { totalCount }
+              }
+            }
+          }
+        }
+        """
+
+        orphaned_labels: List[str] = []
+        scanned_count = 0
+        cursor: Optional[str] = None
+
+        while True:
+            data = self._graphql(
+                query,
+                {"owner": self.org, "repo": self.repo, "cursor": cursor},
+            )
+            labels = data["repository"]["labels"]
+            nodes = labels["nodes"] or []
+            scanned_count += len(nodes)
+
+            for label in nodes:
+                name = label["name"]
+                if not is_sha_label(name):
+                    continue
+                if label["issues"]["totalCount"] > 0:
+                    continue
+                if label["pullRequests"]["totalCount"] > 0:
+                    continue
+                orphaned_labels.append(name)
+
+            page_info = labels["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            cursor = page_info["endCursor"]
+
+        orphaned_labels.sort()
+        total_found = len(orphaned_labels)
+        labels_to_process = orphaned_labels[:limit] if limit is not None else orphaned_labels
+        limit_msg = f"; limiting this run to {len(labels_to_process)}" if limit is not None else ""
+        print(
+            f"📋 Scanned {scanned_count} repository labels; "
+            f"found {total_found} unattached SHA-containing circus labels{limit_msg}"
+        )
+
+        if dry_run:
+            if labels_to_process:
+                print("🔍 Examples of labels that would be deleted:")
+                for label in labels_to_process[:5]:
+                    print(f"  • {label}")
+            return labels_to_process
+
+        deleted_labels = []
+        total = len(labels_to_process)
+        for i, label in enumerate(labels_to_process, 1):
+            if self.delete_repository_label(label):
+                deleted_labels.append(label)
+            if i % 50 == 0:
+                print(f"🗑️ Progress: {i}/{total} labels processed...")
+
+        if total:
+            print(f"🗑️ Deleted {len(deleted_labels)}/{total} orphaned label definitions")
+        return deleted_labels
 
     def create_or_update_label(self, name: str, color: str, description: str) -> bool:
         """Create or update a label with color and description"""

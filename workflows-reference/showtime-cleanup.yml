@@ -30,6 +30,7 @@ jobs:
 
     permissions:
       contents: read
+      issues: write        # GitHub label CRUD uses the issues API
       pull-requests: write
 
     steps:
@@ -47,4 +48,4 @@ jobs:
           fi
 
           echo "Cleaning up environments older than ${MAX_AGE}h"
-          python -m showtime cleanup --older-than "${MAX_AGE}h"
+          python -m showtime cleanup --older-than "${MAX_AGE}h" --force
