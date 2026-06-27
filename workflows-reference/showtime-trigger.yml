@@ -38,6 +38,7 @@ jobs:
 
     permissions:
       contents: read
+      issues: write        # GitHub label CRUD uses the issues API
       pull-requests: write
 
     steps:

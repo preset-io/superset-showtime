@@ -93,7 +93,8 @@ showtime labels                 # Complete label reference
 **Testing/development:**
 ```bash
 showtime sync 1234 --dry-run-aws --dry-run-docker  # Test without costs
-showtime cleanup --dry-run --older-than 1h         # Test cleanup logic
+showtime cleanup --dry-run --older-than 1h         # Test environment + label cleanup
+showtime cleanup-labels                         # Preview stale repo label definitions
 ```
 
 > **Architecture**: This CLI implements ACID-style atomic transactions with direct Docker integration. It handles complete environment lifecycle from Docker build to AWS deployment with race condition prevention.
@@ -217,7 +218,8 @@ showtime start PR_NUMBER             # Create new environment
 showtime stop PR_NUMBER              # Delete environment
 showtime status PR_NUMBER            # Show current state
 showtime list                        # List all environments
-showtime cleanup --older-than 48h    # Clean up expired environments
+showtime cleanup --older-than 48h --force    # Clean up expired envs, closed PR labels, and stale labels
+showtime cleanup-labels --no-dry-run --force  # Prune unattached per-SHA labels only
 ```
 
 
@@ -233,6 +235,7 @@ showtime sync YOUR_PR_NUMBER --dry-run-aws --dry-run-docker
 
 # Test cleanup logic:
 showtime cleanup --dry-run --older-than 24h
+showtime cleanup-labels  # dry-run by default
 ```
 
 ### Development Setup
