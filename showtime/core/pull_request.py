@@ -5,11 +5,12 @@ Handles atomic transactions, trigger processing, and environment orchestration.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
-from .github import GitHubInterface, is_sha_label
+from .github import GitHubInterface
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -66,6 +67,26 @@ def parse_feature_flags(description: Optional[str]) -> List[Dict[str, str]]:
 
 
 @dataclass
+class CleanupResult:
+    """Aggregate outcome for cleanup across one or more tracked shows."""
+
+    success: bool
+    attempted_shas: List[str] = field(default_factory=list)
+    deleted_shas: List[str] = field(default_factory=list)
+    pending_shas: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PromotionResult:
+    """Outcome of attaching a candidate pointer and retiring stale pointers."""
+
+    success: bool
+    pointer_attached: bool
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
 class SyncResult:
     """Result of a PullRequest.sync() operation"""
 
@@ -73,6 +94,7 @@ class SyncResult:
     action_taken: str  # create_environment, rolling_update, cleanup, no_action
     show: Optional[Show] = None
     error: Optional[str] = None
+    cleanup_result: Optional[CleanupResult] = None
 
 
 @dataclass
@@ -100,23 +122,23 @@ class PullRequest:
 
     @property
     def current_show(self) -> Optional[Show]:
-        """The currently active show (from 🎯 label)"""
-        # Find the SHA that's marked as active (🎯)
-        active_sha = None
-        for label in self.labels:
-            if label.startswith("🎪 🎯 "):
-                active_sha = label.split(" ")[2]
-                break
-
-        if not active_sha:
+        """Return the deterministic best active show during pointer recovery."""
+        active_shas = {
+            label.split(" ")[2]
+            for label in self.labels
+            if label.startswith("🎪 🎯 ") and len(label.split(" ")) >= 3
+        }
+        candidates = [show for show in self.shows if show.sha in active_shas]
+        if not candidates:
             return None
-
-        # Find the show with that SHA
-        for show in self.shows:
-            if show.sha == active_sha:
-                return show
-
-        return None
+        return max(
+            candidates,
+            key=lambda show: (
+                show.status == "running",
+                show.created_datetime or datetime.min,
+                show.sha,
+            ),
+        )
 
     @property
     def building_show(self) -> Optional[Show]:
@@ -219,77 +241,94 @@ class PullRequest:
         self.labels.discard(label)  # Safe - won't raise if not present
 
     def remove_sha_labels(self, sha: str, delete_definitions: bool = False) -> None:
-        """Remove all labels for a specific SHA and optionally delete repo-level definitions"""
+        """Detach SHA-owned labels, preserving status until every detail is gone."""
         sha_short = sha[:7]
-        labels_to_remove = [
-            label for label in self.labels if label.startswith("🎪") and sha_short in label
-        ]
+        labels_to_remove = [label for label in self.labels if label.startswith(f"🎪 {sha_short} ")]
         if labels_to_remove:
             print(f"🗑️ Removing SHA {sha_short} labels: {labels_to_remove}")
-            github = get_github() if delete_definitions else None
+            labels_to_remove.sort(key=lambda label: " 🚦 " in label)
             for label in labels_to_remove:
                 self.remove_label(label)
-                if delete_definitions and github:
-                    github.delete_repository_label(label)
 
     def remove_showtime_labels(self, delete_definitions: bool = False) -> None:
-        """Remove ALL circus tent labels from PR and optionally delete repo-level definitions.
+        """Remove all PR label attachments without pruning shared definitions.
 
         Args:
-            delete_definitions: If True, also delete the repo-level label definitions
-                for SHA-containing labels to prevent orphaned label accumulation.
-                Only pass True from teardown/cleanup paths (stop, destroy).
+            delete_definitions: Retained for call compatibility. Repository definitions
+                are pruned only by the attachment-count-qualified global cleanup.
         """
         circus_labels = [label for label in self.labels if label.startswith("🎪 ")]
         if circus_labels:
             print(f"🎪 Removing all showtime labels: {circus_labels}")
-            github = get_github() if delete_definitions else None
             for label in circus_labels:
                 self.remove_label(label)
-                # Delete repo-level definition for SHA-based labels (dynamic/per-env)
-                # Static trigger labels (e.g. showtime-trigger-start) are kept
-                if delete_definitions and github and is_sha_label(label):
-                    github.delete_repository_label(label)
 
-    def set_show_status(self, show: Show, new_status: str) -> None:
-        """Atomically update show status with thorough label cleanup"""
+    def set_show_status(self, show: Show, new_status: str, dry_run: bool = False) -> None:
+        """Attach a replacement status before retiring stale status labels."""
         show.status = new_status
+
+        if dry_run:
+            return
 
         # 1. Refresh labels to get current GitHub state
         self.refresh_labels()
 
-        # 2. Remove ALL existing status labels for this SHA (not just the "expected" one)
+        new_status_label = f"🎪 {show.sha} 🚦 {new_status}"
+        if new_status_label not in self.labels:
+            self.add_label(new_status_label)
+
+        # 2. Remove stale status labels only after the replacement is usable.
         status_labels_to_remove = [
-            label for label in self.labels if label.startswith(f"🎪 {show.sha} 🚦 ")
+            label
+            for label in self.labels
+            if label.startswith(f"🎪 {show.sha} 🚦 ") and label != new_status_label
         ]
 
         for label in status_labels_to_remove:
             self.remove_label(label)
 
-        # 3. Add the new status label
-        new_status_label = f"🎪 {show.sha} 🚦 {new_status}"
-        self.add_label(new_status_label)
-
-    def set_active_show(self, show: Show) -> None:
-        """Atomically set this show as the active environment"""
+    def set_active_show(
+        self, show: Show, *, active: bool = True, dry_run: bool = False
+    ) -> PromotionResult:
+        """Attach a candidate pointer first, or clear only the specified pointer."""
         from .emojis import CIRCUS_PREFIX, MEANING_TO_EMOJI
 
-        # 1. Refresh to get current state
+        if dry_run:
+            return PromotionResult(success=True, pointer_attached=active)
+
         self.refresh_labels()
 
         # 2. Remove ALL existing active pointers (ensure only one)
         active_emoji = MEANING_TO_EMOJI["active"]  # Gets 🎯
         active_prefix = f"{CIRCUS_PREFIX} {active_emoji} "  # "🎪 🎯 "
-        active_pointers = [label for label in self.labels if label.startswith(active_prefix)]
-
-        for pointer in active_pointers:
-            self.remove_label(pointer)
-
-        # 3. Set this show as the new active one
         active_pointer = f"{active_prefix}{show.sha}"  # "🎪 🎯 abc123f"
-        self.add_label(active_pointer)
+        if not active:
+            if active_pointer in self.labels:
+                self.remove_label(active_pointer)
+            return PromotionResult(success=True, pointer_attached=False)
 
-    def _check_authorization(self) -> tuple[bool, dict]:
+        if active_pointer not in self.labels:
+            self.add_label(active_pointer)
+
+        errors = []
+        active_pointers = [
+            label
+            for label in self.labels
+            if label.startswith(active_prefix) and label != active_pointer
+        ]
+        for pointer in active_pointers:
+            try:
+                self.remove_label(pointer)
+            except Exception as exc:
+                errors.append(f"{pointer}: {exc}")
+
+        return PromotionResult(
+            success=not errors,
+            pointer_attached=True,
+            errors=errors,
+        )
+
+    def _check_authorization(self, dry_run_github: bool = False) -> tuple[bool, dict]:
         """Check if current GitHub actor is authorized for operations
 
         Returns:
@@ -338,7 +377,8 @@ class PullRequest:
                     debug_info["auth_status"] = "denied_insufficient_perms"
                     print(f"🚨 Unauthorized actor {actor} (permission: {permission})")
                     # Set blocked label for security
-                    self.add_label("🎪 🔒 showtime-blocked")
+                    if not dry_run_github:
+                        self.add_label("🎪 🔒 showtime-blocked")
                 else:
                     debug_info["auth_status"] = "authorized"
 
@@ -350,7 +390,12 @@ class PullRequest:
             print(f"⚠️ Authorization check failed: {e}")
             return True, debug_info  # Fail open for non-security operations
 
-    def analyze(self, target_sha: str, pr_state: str = "open") -> SyncState:
+    def analyze(
+        self,
+        target_sha: str,
+        pr_state: str = "open",
+        dry_run_github: bool = False,
+    ) -> SyncState:
         """Analyze what actions are needed with comprehensive debugging info
 
         Args:
@@ -390,7 +435,7 @@ class PullRequest:
             blocked_reason = BlockedReason.EXISTING_BLOCKED_LABEL
 
         # Check authorization
-        is_authorized, auth_debug = self._check_authorization()
+        is_authorized, auth_debug = self._check_authorization(dry_run_github)
         if not is_authorized and blocked_reason == BlockedReason.NOT_BLOCKED:
             blocked_reason = BlockedReason.AUTHORIZATION_FAILED
 
@@ -517,6 +562,95 @@ class PullRequest:
                 return AuthStatus.ERROR
             return AuthStatus.ERROR
 
+    def _best_effort_comment(self, callback: Any, *args: Any) -> None:
+        """Run a comment callback without changing lifecycle truth on failure."""
+        try:
+            callback(*args)
+        except Exception as exc:
+            print(f"⚠️ GitHub comment failed: {exc}")
+
+    def _candidate_cleanup(
+        self, candidate: Show, dry_run_github: bool, dry_run_aws: bool
+    ) -> CleanupResult:
+        """Compensate only a failed candidate with verifiable ownership."""
+        if candidate.service_created is False:
+            if candidate.cleanup_pending:
+                return CleanupResult(
+                    success=False,
+                    pending_shas=[candidate.sha],
+                    errors=[f"{candidate.sha}: previous allocation still requires cleanup"],
+                )
+            return CleanupResult(success=True)
+
+        errors: List[str] = []
+        deleted: List[str] = []
+        try:
+            stopped = candidate.stop(
+                dry_run_github=dry_run_github,
+                dry_run_aws=dry_run_aws,
+                require_ownership=True,
+                delete_image=False,
+            )
+            if stopped:
+                deleted.append(candidate.sha)
+            else:
+                errors.append(f"{candidate.sha}: candidate cleanup was not confirmed")
+        except Exception as exc:
+            errors.append(f"{candidate.sha}: {exc}")
+
+        candidate.cleanup_pending = not deleted
+        return CleanupResult(
+            success=bool(deleted),
+            attempted_shas=[candidate.sha],
+            deleted_shas=deleted,
+            pending_shas=[] if deleted else [candidate.sha],
+            errors=errors,
+        )
+
+    def _record_failed_candidate(
+        self,
+        candidate: Show,
+        error: Exception,
+        dry_run_github: bool,
+        dry_run_aws: bool,
+    ) -> SyncResult:
+        """Persist failed candidate truth and any remaining allocation state."""
+        cleanup_result = self._candidate_cleanup(candidate, dry_run_github, dry_run_aws)
+        candidate.status = "failed"
+        try:
+            self._update_show_labels(candidate, dry_run_github)
+        except Exception as label_error:
+            cleanup_result.success = False
+            cleanup_result.errors.append(f"{candidate.sha}: labels: {label_error}")
+            if candidate.sha not in cleanup_result.pending_shas:
+                cleanup_result.pending_shas.append(candidate.sha)
+        return SyncResult(
+            success=False,
+            action_taken="failed",
+            show=candidate,
+            error=str(error),
+            cleanup_result=cleanup_result,
+        )
+
+    def _reconcile_running_show(self, show: Show, dry_run_github: bool) -> SyncResult:
+        """Converge resource labels and pointer state without rebuilding."""
+        self._update_show_labels(show, dry_run_github)
+        promotion = self.set_active_show(show, dry_run=dry_run_github)
+        if promotion.success:
+            return SyncResult(True, "no_action", show=show)
+        cleanup = CleanupResult(
+            success=False,
+            pending_shas=[show.sha],
+            errors=promotion.errors,
+        )
+        return SyncResult(
+            False,
+            "promotion_pending",
+            show=show,
+            error="Active-pointer reconciliation is incomplete",
+            cleanup_result=cleanup,
+        )
+
     def sync(
         self,
         target_sha: str,
@@ -524,7 +658,7 @@ class PullRequest:
         dry_run_aws: bool = False,
         dry_run_docker: bool = False,
     ) -> SyncResult:
-        """Sync PR to desired state with atomic transaction management
+        """Sync PR to desired state while preserving truthful lifecycle state.
 
         Args:
             target_sha: Target commit SHA to sync to
@@ -541,8 +675,12 @@ class PullRequest:
             Exception: On unrecoverable errors (caller should handle)
         """
 
-        # 1. Determine what action is needed
-        action_needed = self._determine_action(target_sha)
+        action_needed = self._determine_action(target_sha, dry_run_github)
+        target_sha_short = short_sha(target_sha)
+        target_before_claim = self.get_show_by_sha(target_sha_short)
+        previous_running = [
+            show for show in self.shows if show.status == "running" and show.sha != target_sha_short
+        ]
 
         # 2. Check for blocked state (fast bailout)
         if action_needed == "blocked":
@@ -569,7 +707,6 @@ class PullRequest:
                 )
             print("✅ Environment claimed successfully")
 
-        # 3a. Extract feature flags from PR description
         feature_flags: List[Dict[str, str]] = []
         if action_needed != "destroy_environment":
             try:
@@ -581,118 +718,94 @@ class PullRequest:
             except Exception as e:
                 print(f"⚠️ Failed to fetch PR description for feature flags: {e}")
 
-        try:
-            # 3. Execute action with error handling
-            if action_needed == "create_environment":
-                show = self._create_new_show(target_sha)
-                print(f"🏗️ Creating environment {show.sha}...")
-                self._post_building_comment(show, dry_run_github)
+        if action_needed == "destroy_environment":
+            result = self.stop_environment(dry_run_github=dry_run_github, dry_run_aws=dry_run_aws)
+            if result.success and result.show:
+                self._best_effort_comment(self._post_cleanup_comment, result.show, dry_run_github)
+            return SyncResult(
+                result.success,
+                "destroy_environment",
+                show=result.show,
+                error=result.error,
+                cleanup_result=result.cleanup_result,
+            )
 
-                # Phase 1: Docker build
-                print("🐳 Building Docker image...")
-                show.build_docker(dry_run_docker)
-                print("✅ Docker build completed")
-
-                # Phase 2: AWS deployment
-                print("☁️ Deploying to AWS ECS...")
-                self.set_show_status(show, "deploying")
-                show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
-                self.set_show_status(show, "running")
-                self.set_active_show(show)
-                print(f"✅ Deployment completed - environment running at {show.ip}:8080")
-                self._update_show_labels(show, dry_run_github)
-
-                # Blue-green cleanup: stop all other environments for this PR
-                cleaned_count = self.stop_previous_environments(
-                    show.sha, dry_run_github, dry_run_aws
-                )
-
-                # Show AWS console URLs for monitoring
-                self._show_service_urls(show)
-
-                self._post_success_comment(show, dry_run_github)
-                return SyncResult(success=True, action_taken="create_environment", show=show)
-
-            elif action_needed in ["rolling_update", "auto_sync"]:
-                old_show = self.current_show
-                if not old_show:
-                    return SyncResult(
-                        success=False,
-                        action_taken="no_current_show",
-                        error="No current show for rolling update",
-                    )
-                new_show = self._create_new_show(target_sha)
-                print(f"🔄 Rolling update: {old_show.sha} → {new_show.sha}")
-                self._post_rolling_start_comment(old_show, new_show, dry_run_github)
-
-                # Phase 1: Docker build
-                print("🐳 Building updated Docker image...")
-                new_show.build_docker(dry_run_docker)
-                print("✅ Docker build completed")
-
-                # Phase 2: Blue-green deployment
-                print("☁️ Deploying updated environment...")
-                self.set_show_status(new_show, "deploying")
-                new_show.deploy_aws(dry_run_aws, feature_flags=feature_flags)
-                self.set_show_status(new_show, "running")
-                self.set_active_show(new_show)
-                print(f"✅ Rolling update completed - new environment at {new_show.ip}:8080")
-                self._update_show_labels(new_show, dry_run_github)
-
-                # Blue-green cleanup: stop all other environments for this PR
-                cleaned_count = self.stop_previous_environments(
-                    new_show.sha, dry_run_github, dry_run_aws
-                )
-
-                # Show AWS console URLs for monitoring
-                self._show_service_urls(new_show)
-
-                self._post_rolling_success_comment(old_show, new_show, dry_run_github)
-                return SyncResult(success=True, action_taken=action_needed, show=new_show)
-
-            elif action_needed == "destroy_environment":
-                # Stop the current environment if it exists
-                if self.current_show:
-                    print(f"🗑️ Destroying environment {self.current_show.sha}...")
-                    success = self.current_show.stop(
-                        dry_run_github=dry_run_github, dry_run_aws=dry_run_aws
-                    )
-                    if success:
-                        print("☁️ AWS resources deleted")
-                    else:
-                        print("⚠️ AWS resource deletion may have failed")
-                    self._post_cleanup_comment(self.current_show, dry_run_github)
-                else:
-                    print("🗑️ No current environment to destroy")
-
-                # ALWAYS remove all circus labels for stop trigger, regardless of current_show
-                if not dry_run_github:
-                    self.remove_showtime_labels(delete_definitions=True)
-                    print("🏷️ GitHub labels cleaned up")
-                print("✅ Environment destroyed")
-                return SyncResult(success=True, action_taken="destroy_environment")
-
-            else:
-                # Reconcile feature flags on running environment when PR has flags.
-                # When PR description has no flags, skip the ECS API call — stale
-                # flags (if any) will be cleaned up on the next deploy.
-                if (
-                    feature_flags
-                    and self.current_show
-                    and self.current_show.status == "running"
-                ):
+        if action_needed not in ["create_environment", "rolling_update", "auto_sync"]:
+            running_target = self.get_show_by_sha(target_sha_short)
+            if running_target and running_target.status == "running":
+                result = self._reconcile_running_show(running_target, dry_run_github)
+                if not result.success:
+                    return result
+                if feature_flags:
                     self._update_feature_flags_if_changed(
-                        self.current_show, feature_flags, dry_run_aws
+                        running_target, feature_flags, dry_run_aws
                     )
-                return SyncResult(success=True, action_taken="no_action")
+            return SyncResult(success=True, action_taken="no_action")
 
-        except Exception as e:
-            # Transaction failed - set failed state and update labels
-            if "show" in locals():
-                show.status = "failed"
-                self._update_show_labels(show, dry_run_github)
-                # TODO: Post failure comment
-            return SyncResult(success=False, action_taken="failed", error=str(e))
+        candidate = self._create_new_show(target_sha)
+        same_sha_rebuild = bool(target_before_claim and target_before_claim.status == "running")
+        if same_sha_rebuild:
+            print(
+                "⚠️ Destructive same-SHA rebuild: deterministic service reuse "
+                "provides no fallback if deployment fails."
+            )
+
+        promotion_committed = False
+        try:
+            print(f"🏗️ Creating environment {candidate.sha}...")
+            self._best_effort_comment(self._post_building_comment, candidate, dry_run_github)
+            candidate.build_docker(dry_run_docker)
+            self.set_show_status(candidate, "deploying", dry_run_github)
+            candidate.deploy_aws(dry_run_aws, feature_flags=feature_flags)
+            self.set_show_status(candidate, "running", dry_run_github)
+            self._update_show_labels(candidate, dry_run_github)
+
+            promotion = self.set_active_show(candidate, dry_run=dry_run_github)
+            promotion_committed = promotion.pointer_attached
+            if not promotion.success:
+                return SyncResult(
+                    False,
+                    "promotion_pending",
+                    show=candidate,
+                    error="Candidate pointer attached, but stale pointers remain",
+                    cleanup_result=CleanupResult(
+                        False,
+                        pending_shas=[candidate.sha],
+                        errors=promotion.errors,
+                    ),
+                )
+
+            cleanup = self._cleanup_shows(
+                previous_running,
+                dry_run_github=dry_run_github,
+                dry_run_aws=dry_run_aws,
+                clear_controls=False,
+            )
+            self._show_service_urls(candidate)
+            self._best_effort_comment(self._post_success_comment, candidate, dry_run_github)
+            if not cleanup.success:
+                return SyncResult(
+                    False,
+                    action_needed,
+                    show=candidate,
+                    error="Previous environment cleanup is incomplete",
+                    cleanup_result=cleanup,
+                )
+            return SyncResult(
+                True,
+                action_needed,
+                show=candidate,
+                cleanup_result=cleanup,
+            )
+        except Exception as exc:
+            if promotion_committed:
+                return SyncResult(
+                    False,
+                    "post_promotion_failed",
+                    show=candidate,
+                    error=f"Environment remains promoted; a later operation failed: {exc}",
+                )
+            return self._record_failed_candidate(candidate, exc, dry_run_github, dry_run_aws)
 
     def start_environment(self, sha: Optional[str] = None, **kwargs: Any) -> SyncResult:
         """Start a new environment (CLI start command logic)"""
@@ -700,26 +813,25 @@ class PullRequest:
         return self.sync(target_sha, **kwargs)
 
     def stop_environment(self, **kwargs: Any) -> SyncResult:
-        """Stop current environment (CLI stop command logic)"""
-        try:
-            # Stop the current environment if it exists
-            if self.current_show:
-                success = self.current_show.stop(**kwargs)
-                if success:
-                    print("☁️ AWS resources deleted")
-                else:
-                    print("⚠️ AWS resource deletion may have failed")
-                    return SyncResult(success=False, action_taken="stop_environment")
-            else:
-                print("🗑️ No current environment to destroy")
-
-            # ALWAYS remove all circus labels for stop command, regardless of current_show
-            if not kwargs.get("dry_run_github", False):
-                self.remove_showtime_labels(delete_definitions=True)
-                print("🏷️ GitHub labels cleaned up")
-            return SyncResult(success=True, action_taken="stopped")
-        except Exception as e:
-            return SyncResult(success=False, action_taken="stop_failed", error=str(e))
+        """Stop every tracked environment and return aggregate cleanup truth."""
+        dry_run_github = bool(kwargs.get("dry_run_github", False))
+        dry_run_aws = bool(kwargs.get("dry_run_aws", False))
+        snapshot = list(self.shows)
+        cleanup = self._cleanup_shows(
+            snapshot,
+            dry_run_github=dry_run_github,
+            dry_run_aws=dry_run_aws,
+            clear_controls=True,
+        )
+        action = "stopped" if cleanup.success else "stop_failed"
+        error = None if cleanup.success else "; ".join(cleanup.errors)
+        return SyncResult(
+            cleanup.success,
+            action,
+            show=self.current_show,
+            error=error,
+            cleanup_result=cleanup,
+        )
 
     def get_status(self) -> dict:
         """Get current status (CLI status command logic)"""
@@ -845,7 +957,7 @@ class PullRequest:
 
         return all_environments
 
-    def _determine_action(self, target_sha: str) -> str:
+    def _determine_action(self, target_sha: str, dry_run_github: bool = False) -> str:
         """Determine what sync action is needed (includes all checks and refreshes labels)"""
         # CRITICAL: Get fresh labels before any decisions
         self.refresh_labels()
@@ -855,7 +967,7 @@ class PullRequest:
             return "blocked"
 
         # Check authorization (security layer)
-        is_authorized, _ = self._check_authorization()
+        is_authorized, _ = self._check_authorization(dry_run_github)
         if not is_authorized:
             return "blocked"
 
@@ -936,21 +1048,9 @@ class PullRequest:
             building_show = self._create_new_show(target_sha)
             building_show.status = "building"
 
-            # Update labels to reflect building state - only remove for this SHA
-            # Skip deleting repo-level definitions here since _update_show_labels
-            # will immediately re-create them via _ensure_label_definition_exists.
-            # Orphan cleanup sweeps handle stale definitions periodically.
-            print(f"🏷️ Removing labels for SHA {target_sha[:7]}...")
-            self.remove_sha_labels(target_sha, delete_definitions=False)
-
-            new_labels = building_show.to_circus_labels()
-            print(f"🏷️ Creating new labels: {new_labels}")
-            for label in new_labels:
-                try:
-                    self.add_label(label)
-                except Exception as e:
-                    print(f"  ❌ Failed to add {label}: {e}")
-                    raise
+            # Reconcile add-first so a failed replacement cannot erase the
+            # prior status sentinel or active pointer.
+            self._update_show_labels(building_show)
 
             # Auto-create PR-level TTL label if not present
             self._ensure_ttl_label()
@@ -985,9 +1085,7 @@ class PullRequest:
         (PR description cleared of all flags) is handled on the next deploy.
         """
         # Build desired state: {name: "True"/"False"} matching ECS format
-        desired_flags: Dict[str, str] = {
-            f["name"]: f["value"] for f in feature_flags
-        }
+        desired_flags: Dict[str, str] = {f["name"]: f["value"] for f in feature_flags}
 
         if dry_run:
             print(f"🏁 [dry-run] Would reconcile feature flags on {show.sha}")
@@ -1013,12 +1111,17 @@ class PullRequest:
         """Create a new Show object for the target SHA"""
         from .date_utils import format_utc_now
 
+        previous = self.get_show_by_sha(short_sha(target_sha))
+        pending = previous if previous and previous.cleanup_pending else None
         return Show(
             pr_number=self.pr_number,
             sha=short_sha(target_sha),
             status="building",
             created_at=format_utc_now(),
             requested_by=GitHubInterface.get_current_actor(),
+            task_definition_arn=pending.task_definition_arn if pending else None,
+            task_definition_fingerprint=(pending.task_definition_fingerprint if pending else None),
+            cleanup_pending=pending is not None,
         )
 
     def _post_building_comment(self, show: Show, dry_run: bool = False) -> None:
@@ -1078,20 +1181,25 @@ class PullRequest:
         Returns:
             True if environment was expired (and stopped), False otherwise
         """
-        if not self.current_show:
-            return False
+        result = self.stop_if_expired_result(max_age_hours, dry_run)
+        return bool(result and result.success)
 
-        # Use Show's expiration logic
-        if self.current_show.is_expired(max_age_hours):
-            if dry_run:
-                print(f"🎪 [DRY-RUN] Would stop expired environment: PR #{self.pr_number}")
-                return True
-
-            print(f"🧹 Stopping expired environment: PR #{self.pr_number}")
-            result = self.stop_environment(dry_run_github=False, dry_run_aws=False)
-            return result.success
-
-        return False  # Not expired
+    def stop_if_expired_result(
+        self, max_age_hours: int, dry_run: bool = False
+    ) -> Optional[CleanupResult]:
+        """Return cleanup detail for an expired active environment, if any."""
+        current = self.current_show
+        if not current or not current.is_expired(max_age_hours):
+            return None
+        print(f"🧹 Stopping expired environment: PR #{self.pr_number}")
+        sync_result = self.stop_environment(dry_run_github=dry_run, dry_run_aws=dry_run)
+        return sync_result.cleanup_result or CleanupResult(
+            success=sync_result.success,
+            attempted_shas=[current.sha],
+            deleted_shas=[current.sha] if sync_result.success else [],
+            pending_shas=[] if sync_result.success else [current.sha],
+            errors=[] if sync_result.success else [sync_result.error or "cleanup failed"],
+        )
 
     def cleanup_orphaned_shows(self, max_age_hours: int, dry_run: bool = False) -> int:
         """Clean up orphaned shows (environments without pointer labels)
@@ -1103,37 +1211,27 @@ class PullRequest:
         Returns:
             Number of orphaned environments cleaned up
         """
-        cleaned_count = 0
+        result = self.cleanup_orphaned_shows_result(max_age_hours, dry_run)
+        return len(result.deleted_shas)
 
-        # Find orphaned shows (shows without active or building pointers)
-        orphaned_shows = []
-        for show in self.shows:
-            has_pointer = any(
-                label in self.labels for label in [f"🎪 🎯 {show.sha}", f"🎪 🏗️ {show.sha}"]
+    def cleanup_orphaned_shows_result(
+        self, max_age_hours: int, dry_run: bool = False
+    ) -> CleanupResult:
+        """Return aggregate cleanup detail for expired shows without pointers."""
+        orphaned = [
+            show
+            for show in self.shows
+            if not any(
+                pointer in self.labels for pointer in [f"🎪 🎯 {show.sha}", f"🎪 🏗️ {show.sha}"]
             )
-            if not has_pointer and show.is_expired(max_age_hours):
-                orphaned_shows.append(show)
-
-        # Clean up each orphaned show
-        for show in orphaned_shows:
-            if dry_run:
-                print(
-                    f"🎪 [DRY-RUN] Would clean orphaned environment: PR #{self.pr_number} SHA {show.sha}"
-                )
-                cleaned_count += 1
-            else:
-                print(f"🧹 Cleaning orphaned environment: PR #{self.pr_number} SHA {show.sha}")
-                # Stop the specific show (AWS resources)
-                success = show.stop(dry_run_github=False, dry_run_aws=False)
-                if success:
-                    # Also clean up GitHub labels for this specific show
-                    self.remove_sha_labels(show.sha, delete_definitions=True)
-                    cleaned_count += 1
-                    print(f"✅ Cleaned orphaned environment: {show.sha}")
-                else:
-                    print(f"⚠️ Failed to clean orphaned environment: {show.sha}")
-
-        return cleaned_count
+            and show.is_expired(max_age_hours)
+        ]
+        return self._cleanup_shows(
+            orphaned,
+            dry_run_github=dry_run,
+            dry_run_aws=dry_run,
+            clear_controls=False,
+        )
 
     @classmethod
     def find_all_with_environments(cls, include_closed: bool = False) -> List[int]:
@@ -1146,64 +1244,80 @@ class PullRequest:
         return get_github().find_prs_with_shows(include_closed=include_closed)
 
     def _update_show_labels(self, show: Show, dry_run: bool = False) -> None:
-        """Update GitHub labels to reflect show state with proper status replacement"""
+        """Reconcile only SHA-owned resource labels, adding before removing."""
         if dry_run:
             return
 
-        # Refresh labels to get current state (atomic claim may have changed them)
         self.refresh_labels()
-
-        # First, remove any existing status labels for this SHA to ensure clean transitions
-        sha_status_labels = [
-            label for label in self.labels if label.startswith(f"🎪 {show.sha} 🚦 ")
-        ]
-        for old_status_label in sha_status_labels:
-            self.remove_label(old_status_label)
-
-        # For running environments, ensure only ONE active pointer exists
-        if show.status == "running":
-            # Remove ALL existing active pointers EXCEPT for this SHA's pointer
-            existing_active_pointers = [
-                label
-                for label in self.labels
-                if label.startswith("🎪 🎯 ") and label != f"🎪 🎯 {show.sha}"
-            ]
-            for old_pointer in existing_active_pointers:
-                print(f"🎯 Removing old active pointer: {old_pointer}")
-                self.remove_label(old_pointer)
-
-            # CRITICAL: Refresh after removals before differential calculation
-            if existing_active_pointers:
-                print("🔄 Refreshing labels after pointer cleanup...")
-                self.refresh_labels()
-
-        # Now do normal differential updates - only for this SHA
-        current_sha_labels = {
-            label
-            for label in self.labels
-            if label.startswith("🎪")
-            and (
-                label.startswith(f"🎪 {show.sha} ")  # SHA-first format: 🎪 abc123f 📅 ...
-                or label.startswith(f"🎪 🎯 {show.sha}")  # Pointer format: 🎪 🎯 abc123f
-            )
-        }
+        current_sha_labels = {label for label in self.labels if label.startswith(f"🎪 {show.sha} ")}
         desired_labels = set(show.to_circus_labels())
 
-        # Remove the status labels we already cleaned up from the differential
-        current_sha_labels = current_sha_labels - set(sha_status_labels)
-
-        # Only add labels that don't exist
-        labels_to_add = desired_labels - current_sha_labels
+        labels_to_add = sorted(desired_labels - current_sha_labels)
         for label in labels_to_add:
             self.add_label(label)
 
-        # Only remove labels that shouldn't exist (excluding status labels already handled)
-        labels_to_remove = current_sha_labels - desired_labels
+        labels_to_remove = sorted(
+            current_sha_labels - desired_labels,
+            key=lambda label: " 🚦 " in label,
+        )
         for label in labels_to_remove:
             self.remove_label(label)
 
-        # Final refresh to update cache with all changes
         self.refresh_labels()
+
+    def _mark_cleanup_pending(self, show: Show, error: str) -> List[str]:
+        """Retain a failed show's discoverability and cleanup-pending marker."""
+        errors = [error]
+        show.cleanup_pending = True
+        try:
+            self._update_show_labels(show)
+        except Exception as exc:
+            errors.append(f"{show.sha}: failed to record cleanup-pending: {exc}")
+        return errors
+
+    def _cleanup_shows(
+        self,
+        shows: List[Show],
+        *,
+        dry_run_github: bool,
+        dry_run_aws: bool,
+        clear_controls: bool,
+    ) -> CleanupResult:
+        """Attempt a snapshot of tracked shows and preserve every failed item."""
+        snapshot = list(shows)
+        deleted: List[str] = []
+        pending: List[str] = []
+        errors: List[str] = []
+        for show in snapshot:
+            try:
+                if not show.stop(dry_run_github=dry_run_github, dry_run_aws=dry_run_aws):
+                    raise RuntimeError("AWS deletion was not confirmed")
+                if not dry_run_github:
+                    self.set_active_show(show, active=False)
+                    self.remove_sha_labels(show.sha, delete_definitions=False)
+                deleted.append(show.sha)
+            except Exception as exc:
+                pending.append(show.sha)
+                errors.extend(
+                    self._mark_cleanup_pending(show, f"{show.sha}: {exc}")
+                    if not dry_run_github
+                    else [f"{show.sha}: {exc}"]
+                )
+
+        if not dry_run_github:
+            try:
+                self.refresh_labels()
+                if clear_controls and not self.shows and not pending:
+                    self.remove_showtime_labels(delete_definitions=False)
+            except Exception as exc:
+                errors.append(f"PR #{self.pr_number}: label cleanup: {exc}")
+        return CleanupResult(
+            success=not errors,
+            attempted_shas=[show.sha for show in snapshot],
+            deleted_shas=deleted,
+            pending_shas=pending,
+            errors=errors,
+        )
 
     def _show_service_urls(self, show: Show) -> None:
         """Show AWS console URLs for monitoring deployment"""
@@ -1228,41 +1342,10 @@ class PullRequest:
         Returns:
             Number of environments stopped
         """
-        # Note: Labels should be fresh from recent _update_show_labels() call
-        stopped_count = 0
-
-        for show in self.shows:
-            if show.sha != keep_sha:
-                print(f"🧹 Cleaning up old environment: {show.sha} ({show.status})")
-                try:
-                    show.stop(dry_run_github=dry_run_github, dry_run_aws=dry_run_aws)
-
-                    # Remove ONLY existing labels for this old environment (not theoretical ones)
-                    if not dry_run_github:
-                        existing_labels = [
-                            label
-                            for label in self.labels
-                            if label.startswith(f"🎪 {show.sha} ") or label == f"🎪 🎯 {show.sha}"
-                        ]
-                        print(f"🏷️ Removing existing labels for {show.sha}: {existing_labels}")
-                        for label in existing_labels:
-                            try:
-                                self.remove_label(label)
-                            except Exception as e:
-                                print(f"⚠️ Failed to remove label {label}: {e}")
-
-                    stopped_count += 1
-                    print(f"✅ Stopped environment {show.sha}")
-
-                except Exception as e:
-                    print(f"❌ Failed to stop environment {show.sha}: {e}")
-
-        if stopped_count > 0:
-            print(f"🧹 Blue-green cleanup: stopped {stopped_count} old environments")
-            # Refresh labels after cleanup
-            if not dry_run_github:
-                self.refresh_labels()
-        else:
-            print("ℹ️ No old environments to clean up")
-
-        return stopped_count
+        cleanup = self._cleanup_shows(
+            [show for show in self.shows if show.sha != keep_sha],
+            dry_run_github=dry_run_github,
+            dry_run_aws=dry_run_aws,
+            clear_controls=False,
+        )
+        return len(cleanup.deleted_shas)

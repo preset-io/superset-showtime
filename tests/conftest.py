@@ -6,10 +6,62 @@ Provides:
 - Stubber-based fixtures for behavior-based AWS tests
 """
 
+from typing import Dict, List, Set, Tuple, Type
+
 import boto3
 import pytest
 from botocore.config import Config
 from botocore.stub import Stubber
+
+
+class StatefulGitHubFake:
+    """In-memory GitHub fake whose reads observe prior label writes."""
+
+    def __init__(self, labels: List[str]) -> None:
+        self.labels = set(labels)
+        self.writes: List[Tuple[str, str]] = []
+        self.comments: List[str] = []
+        self.fail_add: Set[str] = set()
+        self.fail_remove: Set[str] = set()
+        self.fail_comments = False
+        self.base_url = "https://api.github.test"
+        self.org = "apache"
+        self.repo = "superset"
+        self.headers: Dict[str, str] = {}
+
+    def get_labels(self, pr_number: int) -> List[str]:
+        """Return the current label attachments."""
+        return sorted(self.labels)
+
+    def add_label(self, pr_number: int, label: str) -> None:
+        """Attach a label or raise a configured failure."""
+        self.writes.append(("add", label))
+        if label in self.fail_add:
+            raise RuntimeError(f"failed to add {label}")
+        self.labels.add(label)
+
+    def remove_label(self, pr_number: int, label: str) -> None:
+        """Detach a label or raise a configured failure."""
+        self.writes.append(("remove", label))
+        if label in self.fail_remove:
+            raise RuntimeError(f"failed to remove {label}")
+        self.labels.discard(label)
+
+    def post_comment(self, pr_number: int, comment: str) -> None:
+        """Record a comment or raise independently of label writes."""
+        if self.fail_comments:
+            raise RuntimeError("comment failed")
+        self.comments.append(comment)
+
+    def get_pr_data(self, pr_number: int) -> Dict[str, str]:
+        """Return the minimal PR payload needed by lifecycle tests."""
+        return {"body": "", "state": "open"}
+
+
+@pytest.fixture
+def github_fake() -> Type[StatefulGitHubFake]:
+    """Provide the stateful GitHub fake constructor to tests."""
+    return StatefulGitHubFake
 
 
 @pytest.fixture(autouse=True)

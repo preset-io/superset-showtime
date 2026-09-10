@@ -501,9 +501,7 @@ def test_pullrequest_sync_create_environment(mock_get_github: Mock) -> None:
 
                         # Verify state transitions
                         mock_show.build_docker.assert_called_once_with(True)
-                        mock_show.deploy_aws.assert_called_once_with(
-                            True, feature_flags=[]
-                        )
+                        mock_show.deploy_aws.assert_called_once_with(True, feature_flags=[])
                         assert mock_show.status == "running"
 
 
@@ -647,9 +645,9 @@ def test_pullrequest_atomic_claim_success(mock_get_github: Mock) -> None:
                     assert result is True
                     # Verify trigger labels removed
                     mock_remove_label.assert_called_with("🎪 ⚡ showtime-trigger-start")
-                    # Verify SHA labels removed (without deleting definitions to
-                    # avoid wasteful re-creation in _update_show_labels)
-                    mock_remove_sha.assert_called_with("abc123f", delete_definitions=False)
+                    # Add-first reconciliation must not erase the old status
+                    # before replacement attachment succeeds.
+                    mock_remove_sha.assert_not_called()
 
 
 @patch("showtime.core.pull_request.get_github")

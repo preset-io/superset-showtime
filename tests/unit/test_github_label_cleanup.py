@@ -320,8 +320,8 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
     """Tests that label teardown also deletes repo-level definitions"""
 
     @patch("showtime.core.pull_request.get_github")
-    def test_deletes_sha_label_definitions(self, mock_get_github: Any) -> None:
-        """remove_showtime_labels(delete_definitions=True) should delete repo-level defs for SHA labels"""
+    def test_keeps_shared_sha_label_definitions(self, mock_get_github: Any) -> None:
+        """Per-PR removal must leave shared repository definitions intact."""
         from showtime.core.pull_request import PullRequest
 
         mock_github = Mock()
@@ -343,19 +343,11 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
         # All labels removed from PR
         assert mock_github.remove_label.call_count == 5
 
-        # Only SHA-containing labels should have repo definitions deleted
-        delete_calls = [c.args[0] for c in mock_github.delete_repository_label.call_args_list]
-        assert len(delete_calls) == 4  # all labels containing 7+ hex chars
-        assert "🎪 abc123f 🚦 running" in delete_calls
-        assert "🎪 abc123f 🌐 52.1.2.3:8080" in delete_calls
-        assert "🎪 abc123f 📅 2024-01-15T14-30" in delete_calls
-        assert "🎪 🎯 abc123f" in delete_calls  # pointer label contains SHA
-        # Static labels should NOT be deleted from repo
-        assert "🎪 ⚡ showtime-trigger-start" not in delete_calls
+        mock_github.delete_repository_label.assert_not_called()
 
     @patch("showtime.core.pull_request.get_github")
-    def test_remove_sha_labels_deletes_definitions(self, mock_get_github: Any) -> None:
-        """remove_sha_labels(delete_definitions=True) should also delete repo-level definitions"""
+    def test_remove_sha_labels_keeps_definitions(self, mock_get_github: Any) -> None:
+        """SHA attachment removal must not prune repository definitions."""
         from showtime.core.pull_request import PullRequest
 
         mock_github = Mock()
@@ -378,9 +370,7 @@ class TestRemoveShowtimeLabelsDeletesDefinitions:
         assert "🎪 abc123f 🌐 52.1.2.3:8080" in remove_calls
         assert "🎪 def456a 🚦 building" not in remove_calls
 
-        # Repo definitions deleted for removed labels
-        delete_calls = [c.args[0] for c in mock_github.delete_repository_label.call_args_list]
-        assert len(delete_calls) == 2
+        mock_github.delete_repository_label.assert_not_called()
 
     @patch("showtime.core.pull_request.get_github")
     def test_default_skips_definition_deletion(self, mock_get_github: Any) -> None:

@@ -4,7 +4,7 @@
 Main command-line interface for Apache Superset circus tent environment management.
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import typer
 from rich.console import Console
@@ -91,10 +91,13 @@ def _cleanup_repository_labels(
         return 0
 
     deleted_labels = []
+    failed_labels = []
     total = len(orphaned_labels)
     for i, label in enumerate(orphaned_labels, 1):
         if github.delete_repository_label(label):
             deleted_labels.append(label)
+        else:
+            failed_labels.append(label)
         if i % 50 == 0:
             p(f"🗑️ Progress: {i}/{total} labels processed...")
 
@@ -114,6 +117,10 @@ def _cleanup_repository_labels(
                 p("🏷️ Post-delete validation: no orphaned repository labels remain")
     else:
         p("🏷️ No repository labels were deleted")
+    if failed_labels:
+        raise RuntimeError(
+            f"Failed to delete {len(failed_labels)} repository labels: " + ", ".join(failed_labels)
+        )
     return deleted_count
 
 
@@ -124,6 +131,7 @@ def _cleanup_closed_pr_labels(dry_run: bool, force: bool) -> int:
 
     github = get_github()
     closed_prs = []
+    inspection_errors = []
 
     for pr_number in PullRequest.find_all_with_environments(include_closed=True):
         try:
@@ -135,9 +143,12 @@ def _cleanup_closed_pr_labels(dry_run: bool, force: bool) -> int:
                 closed_prs.append(pr_data)
         except Exception as e:
             p(f"⚠️ Failed to inspect PR #{pr_number}: {e}")
+            inspection_errors.append(f"PR #{pr_number}: {e}")
 
     if not closed_prs:
         p("🔒 No closed PRs with stale Showtime labels found")
+        if inspection_errors:
+            raise RuntimeError("Closed PR inspection failed: " + "; ".join(inspection_errors))
         return 0
 
     p(f"🔒 Found {len(closed_prs)} closed PRs with Showtime labels")
@@ -157,14 +168,19 @@ def _cleanup_closed_pr_labels(dry_run: bool, force: bool) -> int:
         return 0
 
     cleaned_count = 0
+    failed_prs = []
     for pr in closed_prs:
         result = pr.stop_environment(dry_run_github=False, dry_run_aws=False)
         if result.success:
             cleaned_count += 1
         else:
             p(f"⚠️ Failed to clean PR #{pr.pr_number}: {result.error}")
+            failed_prs.append(pr.pr_number)
 
     p(f"🔒 ✅ Cleaned Showtime labels from {cleaned_count}/{len(closed_prs)} closed PRs")
+    if failed_prs or inspection_errors:
+        details = [f"PR #{number}" for number in failed_prs] + inspection_errors
+        raise RuntimeError("Failed to clean or inspect closed PRs: " + "; ".join(details))
     return cleaned_count
 
 
@@ -366,23 +382,26 @@ def stop(
     try:
         pr = PullRequest.from_id(pr_number)
 
-        if not pr.current_show:
-            p(f"🎪 No active environment found for PR #{pr_number}")
+        if not pr.shows:
+            p(f"🎪 No tracked environment found for PR #{pr_number}")
             return
 
-        show = pr.current_show
-        p(f"🎪 [bold yellow]Stopping environment for PR #{pr_number}...[/bold yellow]")
-        p(f"Environment: {show.sha} at {show.ip}")
+        p(
+            f"🎪 [bold yellow]Stopping {len(pr.shows)} environment(s) for PR #{pr_number}...[/bold yellow]"
+        )
+        for show in pr.shows:
+            p(f"Environment: {show.sha} at {show.ip}")
 
         if dry_run:
             p("🎪 [bold yellow]DRY RUN[/bold yellow] - Would delete environment:")
-            p(f"  AWS Service: {show.aws_service_name}")
-            p(f"  ECR Image: {show.aws_image_tag}")
+            for show in pr.shows:
+                p(f"  AWS Service: {show.aws_service_name}")
+                p(f"  ECR Image: {show.aws_image_tag}")
             p(f"  Circus Labels: {len(pr.circus_labels)} labels")
             return
 
         if not force:
-            confirm = typer.confirm(f"Delete environment {show.aws_service_name}?")
+            confirm = typer.confirm(f"Delete all {len(pr.shows)} tracked environments?")
             if not confirm:
                 p("🎪 Cancelled")
                 return
@@ -676,7 +695,7 @@ def sync(
 
         if check_only:
             # Analysis mode - just return what's needed
-            sync_state = pr.analyze(target_sha, pr_state)
+            sync_state = pr.analyze(target_sha, pr_state, dry_run_github=True)
             p(sync_state.to_gha_stdout(pr_number))
             return
 
@@ -695,6 +714,7 @@ def sync(
                 p("🎪 ✅ Cleanup completed")
             else:
                 p(f"🎪 ❌ Cleanup failed: {stop_result.error}")
+                raise typer.Exit(1)
             return
 
         # Regular sync for open PRs
@@ -836,7 +856,7 @@ def cleanup(
         time_match = re.match(r"(\d+)([hdw])", older_than)
         if not time_match:
             p(f"❌ Invalid time format: {older_than}")
-            return
+            raise typer.Exit(1)
 
         default_max_age_hours = int(time_match.group(1))
         unit = time_match.group(2)
@@ -876,47 +896,51 @@ def cleanup(
         cleaned_count = 0
         orphan_cleaned_count = 0
         skipped_ttl_count = 0
+        cleanup_errors: List[str] = []
 
         for pr_number in pr_numbers:
-            pr = PullRequest.from_id(pr_number)
+            try:
+                pr = PullRequest.from_id(pr_number)
 
-            # Determine effective TTL for this PR
-            if respect_ttl:
-                pr_ttl_hours = pr.get_pr_ttl_hours()
-                if pr_ttl_hours is None:
-                    # Check if there's an explicit TTL label
-                    ttl_label = next(
-                        (label for label in pr.labels if label.startswith("🎪 ⌛ ")), None
-                    )
-                    if ttl_label:
-                        ttl_value = ttl_label.replace("🎪 ⌛ ", "").strip().lower()
-                        if ttl_value == "close":
-                            # Explicit "close" TTL - never expire by time
-                            skipped_ttl_count += 1
-                            continue
-                        else:
-                            # Invalid/unparsable TTL label - warn and use default
+                # Determine effective TTL for this PR
+                if respect_ttl:
+                    pr_ttl_hours = pr.get_pr_ttl_hours()
+                    if pr_ttl_hours is None:
+                        ttl_label = next(
+                            (label for label in pr.labels if label.startswith("🎪 ⌛ ")),
+                            None,
+                        )
+                        if ttl_label:
+                            ttl_value = ttl_label.replace("🎪 ⌛ ", "").strip().lower()
+                            if ttl_value == "close":
+                                skipped_ttl_count += 1
+                                continue
                             p(
-                                f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', using default {default_max_age_hours}h"
+                                f"⚠️ PR #{pr_number}: Invalid TTL '{ttl_value}', "
+                                f"using default {default_max_age_hours}h"
                             )
                             effective_max_age = default_max_age_hours
+                        else:
+                            effective_max_age = default_max_age_hours
                     else:
-                        # No TTL label - use default
-                        effective_max_age = default_max_age_hours
+                        effective_max_age = pr_ttl_hours
+                        if max_age_cap_hours and effective_max_age > max_age_cap_hours:
+                            effective_max_age = max_age_cap_hours
                 else:
-                    effective_max_age = pr_ttl_hours
-                    # Apply cap if specified
-                    if max_age_cap_hours and effective_max_age > max_age_cap_hours:
-                        effective_max_age = max_age_cap_hours
-            else:
-                effective_max_age = default_max_age_hours
+                    effective_max_age = default_max_age_hours
 
-            # Clean expired environments with pointers
-            if pr.stop_if_expired(effective_max_age, dry_run):
-                cleaned_count += 1
+                expired = pr.stop_if_expired_result(effective_max_age, dry_run)
+                if expired:
+                    cleaned_count += len(expired.deleted_shas)
+                    if not expired.success:
+                        cleanup_errors.extend(expired.errors)
 
-            # Clean orphaned environments without pointers
-            orphan_cleaned_count += pr.cleanup_orphaned_shows(effective_max_age, dry_run)
+                orphaned = pr.cleanup_orphaned_shows_result(effective_max_age, dry_run)
+                orphan_cleaned_count += len(orphaned.deleted_shas)
+                if not orphaned.success:
+                    cleanup_errors.extend(orphaned.errors)
+            except Exception as e:
+                cleanup_errors.append(f"PR #{pr_number}: {e}")
 
         if cleaned_count > 0 or orphan_cleaned_count > 0 or skipped_ttl_count > 0:
             if cleaned_count > 0:
@@ -979,10 +1003,23 @@ def cleanup(
                                 # Parse service name to get PR number
                                 svc = ServiceName.from_service_name(service_name_str)
                                 # Pass base name (without -service) to delete_environment
-                                aws.delete_environment(svc.base_name, svc.pr_number)
-                                aws_cleaned_count += 1
+                                delete_kwargs = {}
+                                task_definition_arn = orphan.get("task_definition_arn")
+                                if task_definition_arn:
+                                    delete_kwargs[
+                                        "expected_task_definition_arn"
+                                    ] = task_definition_arn
+                                if aws.delete_environment(
+                                    svc.base_name, svc.pr_number, **delete_kwargs
+                                ):
+                                    aws_cleaned_count += 1
+                                else:
+                                    cleanup_errors.append(
+                                        f"AWS {service_name_str}: deletion not confirmed"
+                                    )
                             except ValueError as e:
                                 p(f"⚠️ Skipping invalid service name {service_name_str}: {e}")
+                                cleanup_errors.append(f"AWS {service_name_str}: {e}")
                                 continue
 
                 if aws_cleaned_count > 0:
@@ -992,6 +1029,7 @@ def cleanup(
 
             except Exception as e:
                 p(f"⚠️ AWS orphan scan failed: {e}")
+                cleanup_errors.append(f"AWS orphan scan: {e}")
 
         # Phase 3: Closed PR label cleanup
         closed_pr_cleaned_count = 0
@@ -1000,6 +1038,7 @@ def cleanup(
                 closed_pr_cleaned_count = _cleanup_closed_pr_labels(dry_run, force)
             except Exception as e:
                 p(f"⚠️ Closed PR label cleanup failed: {e}")
+                cleanup_errors.append(f"closed PR cleanup: {e}")
 
         # Phase 4: Repository label cleanup
         label_cleaned_count = 0
@@ -1012,6 +1051,7 @@ def cleanup(
                 )
             except Exception as e:
                 p(f"⚠️ Repository label scan failed: {e}")
+                cleanup_errors.append(f"repository label cleanup: {e}")
 
         # Final summary
         total_cleaned = (
@@ -1021,11 +1061,20 @@ def cleanup(
             p(
                 f"\n🎉 [bold green]Total cleanup: {cleaned_count} environments + {aws_cleaned_count} AWS orphans + {closed_pr_cleaned_count} closed PRs + {label_cleaned_count} labels[/bold green]"
             )
-        else:
+        elif not cleanup_errors:
             p("\n✨ [bold green]No cleanup needed - everything is clean![/bold green]")
 
+        if cleanup_errors:
+            p("❌ Cleanup completed with failures:")
+            for error in cleanup_errors:
+                p(f"  • {error}")
+            raise typer.Exit(1)
+
+    except typer.Exit:
+        raise
     except Exception as e:
         p(f"❌ Cleanup failed: {e}")
+        raise typer.Exit(1) from e
 
 
 @app.command()

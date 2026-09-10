@@ -6,6 +6,7 @@ Single environment operations: Docker build, AWS deployment, state transitions.
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from typing import Dict, List, Optional
 
 
@@ -19,6 +20,11 @@ def get_interfaces():  # type: ignore
     return GitHubInterface(), AWSInterface()
 
 
+def task_definition_fingerprint(task_definition_arn: str) -> str:
+    """Return the compact ownership fingerprint stored in GitHub labels."""
+    return sha256(task_definition_arn.encode()).hexdigest()[:32]
+
+
 @dataclass
 class Show:
     """Single ephemeral environment state from circus labels"""
@@ -29,7 +35,16 @@ class Show:
     ip: Optional[str] = None  # Environment IP address
     created_at: Optional[str] = None  # ISO timestamp
     requested_by: Optional[str] = None  # GitHub username
+    task_definition_arn: Optional[str] = None
+    task_definition_fingerprint: Optional[str] = None
+    service_created: Optional[bool] = False
+    cleanup_pending: bool = False
     # Note: TTL is now managed at PR-level, not per-Show. See PullRequest.get_pr_ttl_hours()
+
+    def __post_init__(self) -> None:
+        """Derive persistent ownership state from a runtime task definition ARN."""
+        if self.task_definition_arn and not self.task_definition_fingerprint:
+            self.task_definition_fingerprint = task_definition_fingerprint(self.task_definition_arn)
 
     @property
     def aws_service_name(self) -> str:
@@ -128,6 +143,12 @@ class Show:
                 f"{CIRCUS_PREFIX} {self.sha} {MEANING_TO_EMOJI['requested_by']} {self.requested_by}"
             )
 
+        if self.task_definition_fingerprint:
+            labels.append(f"{CIRCUS_PREFIX} {self.sha} 🧬 {self.task_definition_fingerprint}")
+
+        if self.cleanup_pending:
+            labels.append(f"{CIRCUS_PREFIX} {self.sha} 🧹 cleanup-pending")
+
         return labels
 
     def build_docker(self, dry_run: bool = False) -> None:
@@ -151,6 +172,25 @@ class Show:
                 feature_flags=feature_flags,
             )
 
+            result_service_created = getattr(result, "service_created", False)
+            self.service_created = (
+                result_service_created
+                if result_service_created is None or isinstance(result_service_created, bool)
+                else False
+            )
+            # A pre-creation failure cannot retire a previous allocation's ownership.
+            if self.service_created is not False or not self.cleanup_pending:
+                result_task_definition = getattr(result, "task_definition_arn", None)
+                self.task_definition_arn = (
+                    result_task_definition if isinstance(result_task_definition, str) else None
+                )
+                self.task_definition_fingerprint = (
+                    task_definition_fingerprint(self.task_definition_arn)
+                    if self.task_definition_arn
+                    else None
+                )
+                self.cleanup_pending = False
+
             if not result.success:
                 raise Exception(f"AWS deployment failed: {result.error}")
 
@@ -160,20 +200,39 @@ class Show:
             # Mock successful deployment for dry-run
             self.ip = "52.1.2.3"
 
-    def stop(self, dry_run_github: bool = False, dry_run_aws: bool = False) -> bool:
+    def stop(
+        self,
+        dry_run_github: bool = False,
+        dry_run_aws: bool = False,
+        *,
+        require_ownership: bool = False,
+        delete_image: bool = True,
+    ) -> bool:
         """Stop this environment (cleanup AWS resources)
 
         Returns:
             True if successful, False otherwise
         """
-        github, aws = get_interfaces()
+        if dry_run_aws:
+            return True
 
         # Delete AWS resources (pure technical work)
-        if not dry_run_aws:
+        _, aws = get_interfaces()
+        expected_arn = self.task_definition_arn if require_ownership else None
+        expected_fingerprint = (
+            self.task_definition_fingerprint if require_ownership or self.cleanup_pending else None
+        )
+        if require_ownership or self.cleanup_pending:
+            result = aws.delete_environment(
+                self.aws_service_name,
+                self.pr_number,
+                expected_task_definition_arn=expected_arn,
+                expected_task_definition_fingerprint=expected_fingerprint or "",
+                delete_image=delete_image,
+            )
+        else:
             result = aws.delete_environment(self.aws_service_name, self.pr_number)
-            return bool(result)
-
-        return True  # Dry run is always "successful"
+        return bool(result)
 
     def _build_docker_image(self) -> None:
         """Build Docker image for this environment"""
@@ -289,6 +348,10 @@ class Show:
                 # Note: TTL (⌛) labels are now PR-level, not per-SHA. Ignored here.
                 elif emoji == "🤡":  # User (clown!)
                     show_data["requested_by"] = value
+                elif emoji == "🧬":  # Task definition ownership fingerprint
+                    show_data["task_definition_fingerprint"] = value
+                elif emoji == "🧹" and value == "cleanup-pending":
+                    show_data["cleanup_pending"] = True
 
         # Return Show if we found any status labels for this SHA
         # For list purposes, we want to show ALL environments, even orphaned ones

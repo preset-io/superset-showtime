@@ -17,7 +17,7 @@ Superset Showtime is a CLI tool designed primarily for **GitHub Actions** to man
 3. Watch the magic happen - labels will update automatically
 4. When you see `🎪 🚦 {sha} running`, your environment is ready!
 5. Get URL from `🎪 🌐 {sha} {ip}` → `http://{ip}:8080`
-6. **Every new commit automatically deploys a fresh environment** (zero-downtime)
+6. **Every new commit can deploy a fresh environment** while the prior SHA remains available until promotion succeeds
 
 **To test a specific commit without auto-updates:**
 - Add label: `🎪 🧊 showtime-freeze` (prevents auto-sync on new commits)
@@ -26,7 +26,7 @@ Superset Showtime is a CLI tool designed primarily for **GitHub Actions** to man
 ```bash
 # Add this label:
 🎪 🛑 showtime-trigger-stop
-# All circus labels disappear, AWS resources cleaned up
+# Labels disappear only after AWS deletion is confirmed
 ```
 
 ## 🎪 How It Works
@@ -93,11 +93,12 @@ showtime labels                 # Complete label reference
 **Testing/development:**
 ```bash
 showtime sync 1234 --dry-run-aws --dry-run-docker  # Test without costs
+showtime sync 1234 --dry-run-github                 # Read GitHub state without writes
 showtime cleanup --dry-run --older-than 1h         # Test environment + label cleanup
 showtime cleanup-labels                         # Preview stale repo label definitions
 ```
 
-> **Architecture**: This CLI implements ACID-style atomic transactions with direct Docker integration. It handles complete environment lifecycle from Docker build to AWS deployment with race condition prevention.
+> **Architecture**: GitHub label writes and AWS operations are not transactional. Showtime preserves the previous environment during a different-SHA deployment and records partial cleanup so serialized retries can converge safely. Callers must serialize operations for each PR; there is no distributed global lock.
 
 ## 🎪 Complete Label Reference
 
@@ -106,7 +107,7 @@ showtime cleanup-labels                         # Preview stale repo label defin
 | Label | Action | Result |
 |-------|---------|---------|
 | `🎪 ⚡ showtime-trigger-start` | Create environment | Builds and deploys ephemeral environment with blue-green deployment |
-| `🎪 🛑 showtime-trigger-stop` | Destroy environment | Cleans up AWS resources and removes all labels |
+| `🎪 🛑 showtime-trigger-stop` | Destroy environment | Removes resource labels only after confirmed AWS deletion |
 | `🎪 🧊 showtime-freeze` | Freeze environment | Prevents auto-sync on new commits (for testing specific SHAs) |
 
 ### 📊 State Labels (Automatically Managed)
@@ -120,6 +121,8 @@ showtime cleanup-labels                         # Preview stale repo label defin
 | `🎪 {sha} 🌐 {ip:port}` | Environment URL | `🎪 abc123f 🌐 52.1.2.3:8080` |
 | `🎪 {sha} ⌛ {ttl}` | Time-to-live policy | `🎪 abc123f ⌛ 24h` |
 | `🎪 {sha} 🤡 {username}` | Who requested | `🎪 abc123f 🤡 maxime` |
+| `🎪 {sha} 🧬 {fingerprint}` | Task-definition ownership used for guarded cleanup | `🎪 abc123f 🧬 0123456789abcdef0123456789abcdef` |
+| `🎪 {sha} 🧹 cleanup-pending` | AWS deletion is unconfirmed and tracking must remain | `🎪 abc123f 🧹 cleanup-pending` |
 
 ## 🔧 Testing Configuration Changes
 
@@ -177,8 +180,24 @@ You'll see:
 🎪 def456a 🚦 running       # New environment live
 🎪 🎯 def456a               # Traffic switched
 🎪 def456a 🌐 52-4-5-6      # New IP address
-# All abc123f labels removed automatically
+# abc123f labels are removed after its AWS deletion is confirmed
 ```
+
+The cross-SHA flow promotes the candidate only after deployment succeeds. A failed
+candidate does not move the active pointer or delete the prior healthy service.
+Cleanup removes labels only after service absence is confirmed; false returns,
+exceptions, ownership mismatches, and uncertain AWS responses retain tracking and
+make the CLI exit nonzero.
+
+An explicit rebuild of the same SHA is different: service names are deterministic,
+so it destructively reuses that service identity and has no fallback environment.
+Showtime warns before this path. Per-PR operations must remain serialized. GitHub
+label writes can still be partially applied, and a later sync reconciles the active
+pointer without rebuilding a candidate that is already marked running.
+
+Per-PR teardown only detaches labels. Repository-wide label definitions may be
+shared by other PRs and are deleted exclusively by `cleanup-labels` after a global
+attachment-count check.
 
 ## 🔒 Security & Permissions
 
@@ -200,7 +219,7 @@ You'll see:
 
 **Commands used:**
 ```bash
-showtime sync PR_NUMBER --check-only    # Determine build_needed + target_sha
+showtime sync PR_NUMBER --check-only    # Read-only: determine build_needed + target_sha
 showtime sync PR_NUMBER --sha SHA       # Execute atomic claim + build + deploy
 ```
 
