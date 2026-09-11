@@ -62,8 +62,12 @@ flowchart TD
 
     D --> H[📋 State: building]
     E --> H
-    H --> I[🐳 Docker build]
-    I -->|Success| J[📋 State: built]
+    H --> I[🐳 Docker build + immutable digest]
+    I -->|Success| S{Runner smoke enabled?}
+    S -->|Yes| T[Local /health smoke + owned cleanup]
+    S -->|No| J[📋 State: built]
+    T -->|Healthy and cleaned| J
+    T -->|Failure| K
     I -->|Fail| K[📋 State: failed]
 
     J --> L[📋 State: deploying]
@@ -247,6 +251,63 @@ redacted; raw task environments and AWS exception payloads are not printed.
 Diagnostic failures cannot suppress candidate cleanup or erase the primary
 failure. Total command time can exceed the startup budget by this diagnostic
 allowance and the existing bounded cleanup waits.
+
+## Optional runner smoke test
+
+`start` and `sync` expose a local pre-deployment smoke test. It is off by
+default and can be enabled with `--smoke-test` or `SHOWTIME_SMOKE_TEST=true`.
+The managed path builds and pushes `linux/amd64`, reads Buildx's manifest
+digest, then uses that exact `apache/superset@sha256:...` reference for both
+the smoke container and ECS task definition. Missing or malformed digest
+metadata stops before smoke or AWS.
+
+```bash
+showtime sync PR_NUMBER --smoke-test \
+  --build-timeout-seconds 3600 \
+  --smoke-timeout-seconds 600 \
+  --smoke-diagnostics-dir .showtime/diagnostics
+```
+
+Environment equivalents are `SHOWTIME_BUILD_TIMEOUT_SECONDS`,
+`SHOWTIME_SMOKE_TIMEOUT_SECONDS`, and `SHOWTIME_SMOKE_DIAGNOSTICS_DIR`.
+Timeouts must be positive integers. The diagnostics path must be writable and
+must not use symlinked directories. The reference Actions job allows 120 minutes;
+adjust its job timeout when changing the build, smoke, ECS, or cleanup budgets.
+
+The disposable container is rendered from the packaged ECS task definition,
+including effective feature flags, entrypoint, command, container port, 0.5
+CPU, and 2 GiB memory with swap capped at the same value. Its port is published
+only on `127.0.0.1` with an ephemeral host port. Environment values are written
+to a mode-0600 temporary env file, never command arguments, and the file is
+deleted immediately after create. Success requires `/health` HTTP 200 and
+verified removal of the randomly named, ownership-labelled container before
+any AWS allocation. ECS readiness remains mandatory afterward.
+
+Build output, Docker errors, and retained logs use the same redaction rules
+and finite buffers. On smoke failure Showtime writes unique mode-0600
+`runner-smoke-pr-<pr>-<sha>-<attempt>.json` and `.log` files. JSON contains only
+the primary outcome, selected container state, mapped port, immutable image,
+log status, cleanup result, and secondary evidence errors. Log status is one
+of `captured_nonempty`, `captured_empty`, `unavailable`, or `not_attempted`;
+logs are limited to 100 lines and 16 KiB. Process output retention is limited
+to 64 KiB. Docker commands have 30-second execution budgets, HTTP requests have seven-second
+request envelopes, and diagnostic and cleanup work have separate 30-second budgets.
+Subprocess shutdown can add up to seven seconds for TERM/KILL handling. Handled SIGINT
+and SIGTERM trigger bounded evidence and owned cleanup; SIGKILL cannot be
+cleaned up by the process.
+
+Showtime creates local diagnostic files but does not upload them. Every
+consuming workflow must add an `if: always()` `actions/upload-artifact@v4`
+step with `include-hidden-files: true` and the narrow path
+`.showtime/diagnostics/runner-smoke-*`; do not upload `.showtime/` wholesale.
+See `workflows-reference/showtime-trigger.yml` for the default-off example.
+
+The smoke check approximates packaged startup and resource limits. It does not
+reproduce Fargate networking, scheduling, or logging, does not establish the
+unknown incident cause, and never replaces strict ECS readiness. Fully mocked
+testing remains available with both `--dry-run-docker --dry-run-aws`; skipping
+Docker is rejected with live AWS or with smoke enabled because neither can
+prove immutable identity.
 
 ## 🔒 Security & Permissions
 

@@ -4,13 +4,11 @@
 Replicates the AWS logic from current GitHub Actions workflows.
 """
 
-import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import boto3  # type: ignore[import-untyped]
@@ -28,6 +26,7 @@ from .readiness import (
     configured_secret_values,
     validate_startup_timeout_seconds,
 )
+from .task_definition import render_task_definition, validate_image_reference
 
 # Module logger for machine-readable events (separate from CLI print statements)
 logger = logging.getLogger(__name__)
@@ -111,6 +110,7 @@ class AWSInterface:
         image_tag_override: Optional[str] = None,
         force: bool = False,
         startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        image_reference: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Create ephemeral environment (replaces any existing service with same name)
@@ -124,6 +124,13 @@ class AWSInterface:
         """
 
         startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
+        if image_tag_override and image_reference:
+            return EnvironmentResult(
+                False,
+                error="image tag override and immutable reference are exclusive",
+            )
+        if image_reference:
+            image_reference = validate_image_reference(image_reference)
 
         # Create Show object for consistent AWS naming
         from .date_utils import format_utc_now
@@ -204,7 +211,10 @@ class AWSInterface:
                 else:
                     print("ℹ️ No existing service found, proceeding with new deployment")
             # Step 1: Determine which Docker image to use (DockerHub direct)
-            if image_tag_override:
+            if image_reference:
+                docker_image = image_reference
+                print(f"✅ Using immutable DockerHub image: {docker_image}")
+            elif image_tag_override:
                 # Use explicit override (can be any format)
                 docker_image = f"apache/superset:{image_tag_override}"
                 print(f"✅ Using override image: {docker_image}")
@@ -619,19 +629,7 @@ class AWSInterface:
     ) -> Optional[str]:
         """Create ECS task definition with DockerHub image and feature flags"""
         try:
-            # Load base task definition template
-            task_def_path = Path(__file__).parent.parent / "data" / "ecs-task-definition.json"
-            with open(task_def_path) as f:
-                task_def = json.load(f)
-
-            # Use DockerHub image directly (no ECR needed)
-            # docker_image is already in format: apache/superset:abc123f-ci
-            task_def["containerDefinitions"][0]["image"] = docker_image
-
-            # Add feature flags to environment (replicate GHA jq environment update)
-            container_env = task_def["containerDefinitions"][0]["environment"]
-            for flag in feature_flags:
-                container_env.append(flag)
+            task_def = render_task_definition(docker_image, feature_flags)
 
             # Register task definition
             response = self.ecs_client.register_task_definition(**task_def)

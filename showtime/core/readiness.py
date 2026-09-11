@@ -17,13 +17,11 @@
 
 """Bounded, task-aware ECS startup readiness and redacted diagnostics."""
 
-import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import httpx
@@ -841,9 +839,9 @@ class ECSReadinessObserver:
 
 def packaged_container() -> Dict[str, Any]:
     """Read the packaged container configuration without displaying it."""
-    path = Path(__file__).parent.parent / "data" / "ecs-task-definition.json"
-    with path.open() as stream:
-        return dict(json.load(stream)["containerDefinitions"][0])
+    from .task_definition import load_packaged_task_definition, rendered_container
+
+    return rendered_container(load_packaged_task_definition())
 
 
 def configured_secret_values(
@@ -859,7 +857,11 @@ def configured_secret_values(
         "SUPERSET_SECRET_KEY",
     )
     values = [value for name in names if (value := os.getenv(name))]
-    entries = list(packaged_container().get("environment", [])) + list(feature_flags or [])
+    from .task_definition import render_task_definition, rendered_container
+
+    placeholder = "apache/superset@sha256:" + "0" * 64
+    rendered = rendered_container(render_task_definition(placeholder, feature_flags))
+    entries = list(rendered.get("environment", []))
     for entry in entries:
         if re.search(r"SECRET|PASSWORD|PASSWD|TOKEN|KEY", entry.get("name", ""), re.I):
             value = entry.get("value")

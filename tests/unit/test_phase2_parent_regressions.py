@@ -436,7 +436,13 @@ def test_diagnostics_precede_real_orchestration_compensation(
             patch.object(pr, "_determine_action", return_value="create_environment")
         )
         stack.enter_context(patch.object(pr, "_create_new_show", return_value=candidate))
-        stack.enter_context(patch.object(candidate, "build_docker"))
+        stack.enter_context(
+            patch.object(
+                candidate,
+                "build_docker",
+                return_value="apache/superset@sha256:" + "a" * 64,
+            )
+        )
         stack.enter_context(
             patch.object(candidate, "stop", side_effect=lambda **kw: trace.append("stop") or True)
         )

@@ -17,6 +17,13 @@ from .core.github_messages import (
 )
 from .core.pull_request import PullRequest
 from .core.readiness import DEFAULT_STARTUP_TIMEOUT_SECONDS, validate_startup_timeout_seconds
+from .core.runner_smoke import (
+    DEFAULT_BUILD_TIMEOUT_SECONDS,
+    DEFAULT_DIAGNOSTICS_DIR,
+    DEFAULT_SMOKE_TIMEOUT_SECONDS,
+    validate_diagnostics_directory,
+    validate_positive_seconds,
+)
 from .core.show import Show
 
 # Constants
@@ -241,10 +248,37 @@ def start(
         envvar="SHOWTIME_STARTUP_TIMEOUT_SECONDS",
         help="Overall ECS startup readiness budget in seconds",
     ),
+    smoke_test: bool = typer.Option(
+        False,
+        "--smoke-test/--no-smoke-test",
+        envvar="SHOWTIME_SMOKE_TEST",
+        help="Run a disposable local startup check before AWS deployment",
+    ),
+    smoke_timeout_seconds: int = typer.Option(
+        DEFAULT_SMOKE_TIMEOUT_SECONDS,
+        "--smoke-timeout-seconds",
+        envvar="SHOWTIME_SMOKE_TIMEOUT_SECONDS",
+        help="Overall runner-smoke budget in seconds",
+    ),
+    build_timeout_seconds: int = typer.Option(
+        DEFAULT_BUILD_TIMEOUT_SECONDS,
+        "--build-timeout-seconds",
+        envvar="SHOWTIME_BUILD_TIMEOUT_SECONDS",
+        help="Overall Docker build and output-drain budget in seconds",
+    ),
+    smoke_diagnostics_dir: str = typer.Option(
+        DEFAULT_DIAGNOSTICS_DIR,
+        "--smoke-diagnostics-dir",
+        envvar="SHOWTIME_SMOKE_DIAGNOSTICS_DIR",
+        help="Directory for failed runner-smoke diagnostic files",
+    ),
 ) -> None:
     """Create ephemeral environment for PR"""
     try:
         startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
+        smoke_timeout_seconds = validate_positive_seconds(smoke_timeout_seconds, "smoke timeout")
+        build_timeout_seconds = validate_positive_seconds(build_timeout_seconds, "build timeout")
+        smoke_diagnostics_dir = str(validate_diagnostics_directory(smoke_diagnostics_dir))
         pr = PullRequest.from_id(pr_number)
 
         # Check if working environment already exists (unless force)
@@ -282,6 +316,10 @@ def start(
             dry_run_github=False,
             dry_run_aws=dry_run_aws,
             startup_timeout_seconds=startup_timeout_seconds,
+            smoke_test=smoke_test,
+            smoke_timeout_seconds=smoke_timeout_seconds,
+            build_timeout_seconds=build_timeout_seconds,
+            smoke_diagnostics_dir=smoke_diagnostics_dir,
         )
 
         if result.success:
@@ -677,10 +715,41 @@ def sync(
         envvar="SHOWTIME_STARTUP_TIMEOUT_SECONDS",
         help="Overall ECS startup readiness budget in seconds",
     ),
+    smoke_test: bool = typer.Option(
+        False,
+        "--smoke-test/--no-smoke-test",
+        envvar="SHOWTIME_SMOKE_TEST",
+        help="Run a disposable local startup check before AWS deployment",
+    ),
+    smoke_timeout_seconds: int = typer.Option(
+        DEFAULT_SMOKE_TIMEOUT_SECONDS,
+        "--smoke-timeout-seconds",
+        envvar="SHOWTIME_SMOKE_TIMEOUT_SECONDS",
+        help="Overall runner-smoke budget in seconds",
+    ),
+    build_timeout_seconds: int = typer.Option(
+        DEFAULT_BUILD_TIMEOUT_SECONDS,
+        "--build-timeout-seconds",
+        envvar="SHOWTIME_BUILD_TIMEOUT_SECONDS",
+        help="Overall Docker build and output-drain budget in seconds",
+    ),
+    smoke_diagnostics_dir: str = typer.Option(
+        DEFAULT_DIAGNOSTICS_DIR,
+        "--smoke-diagnostics-dir",
+        envvar="SHOWTIME_SMOKE_DIAGNOSTICS_DIR",
+        help="Directory for failed runner-smoke diagnostic files",
+    ),
 ) -> None:
     """🎪 Intelligently sync PR to desired state (called by GitHub Actions)"""
     try:
         startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
+        smoke_timeout_seconds = validate_positive_seconds(smoke_timeout_seconds, "smoke timeout")
+        build_timeout_seconds = validate_positive_seconds(build_timeout_seconds, "build timeout")
+        smoke_diagnostics_dir = str(validate_diagnostics_directory(smoke_diagnostics_dir))
+        if dry_run_docker and not dry_run_aws:
+            raise ValueError("--dry-run-docker requires --dry-run-aws")
+        if dry_run_docker and smoke_test:
+            raise ValueError("runner smoke cannot be enabled when Docker is skipped")
         # Validate required Git SHA unless using --check-only
         if not check_only:
             from .core.git_validation import (
@@ -744,6 +813,10 @@ def sync(
             dry_run_aws=dry_run_aws,
             dry_run_docker=dry_run_docker,
             startup_timeout_seconds=startup_timeout_seconds,
+            smoke_test=smoke_test,
+            smoke_timeout_seconds=smoke_timeout_seconds,
+            build_timeout_seconds=build_timeout_seconds,
+            smoke_diagnostics_dir=smoke_diagnostics_dir,
         )
 
         if result.success:

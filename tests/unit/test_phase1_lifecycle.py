@@ -564,7 +564,9 @@ def test_previous_cleanup_failure_keeps_promoted_candidate_healthy(
     old_show = pr.shows[0]
     old_show.stop = Mock(return_value=False)  # type: ignore[method-assign]
     candidate = Show(1234, "new456a", "building")
-    candidate.build_docker = Mock()  # type: ignore[method-assign]
+    candidate.build_docker = Mock(  # type: ignore[method-assign]
+        return_value="apache/superset@sha256:" + "a" * 64
+    )
     candidate.deploy_aws = Mock()  # type: ignore[method-assign]
 
     with ExitStack() as stack:
@@ -575,7 +577,7 @@ def test_previous_cleanup_failure_keeps_promoted_candidate_healthy(
         )
         stack.enter_context(patch.object(pr, "_create_new_show", return_value=candidate))
         stack.enter_context(patch.object(pr, "_show_service_urls"))
-        result = pr.sync("new456a", dry_run_aws=False, dry_run_docker=True)
+        result = pr.sync("new456a", dry_run_aws=False, dry_run_docker=False)
 
     assert result.success is False
     assert result.cleanup_result is not None

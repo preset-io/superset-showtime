@@ -4,10 +4,11 @@
 Single environment operations: Docker build, AWS deployment, state transitions.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .readiness import (
     DEFAULT_STARTUP_TIMEOUT_SECONDS,
@@ -15,6 +16,17 @@ from .readiness import (
     configured_secret_values,
     render_diagnostic_summary,
 )
+from .runner_smoke import (
+    DEFAULT_BUILD_TIMEOUT_SECONDS,
+    DEFAULT_DIAGNOSTICS_DIR,
+    DEFAULT_SMOKE_TIMEOUT_SECONDS,
+    RunnerSmoke,
+    SmokeResult,
+    run_bounded_process,
+)
+from .task_definition import render_task_definition
+
+OUTPUT_METADATA_LIMIT = 64 * 1024
 
 
 # Import interfaces for singleton access
@@ -159,28 +171,56 @@ class Show:
 
         return labels
 
-    def build_docker(self, dry_run: bool = False) -> None:
+    def build_docker(
+        self,
+        dry_run: bool = False,
+        build_timeout_seconds: int = DEFAULT_BUILD_TIMEOUT_SECONDS,
+    ) -> Optional[str]:
         """Build Docker image for this environment (atomic operation)"""
         if not dry_run:
-            self._build_docker_image()  # Raises on failure
+            return self._build_docker_image(build_timeout_seconds)  # Raises on failure
+        return None
+
+    def run_smoke(
+        self,
+        image_reference: str,
+        feature_flags: Optional[List[Dict[str, str]]] = None,
+        timeout_seconds: int = DEFAULT_SMOKE_TIMEOUT_SECONDS,
+        diagnostics_dir: str = DEFAULT_DIAGNOSTICS_DIR,
+        runner: Optional[RunnerSmoke] = None,
+    ) -> SmokeResult:
+        """Smoke-test the same rendered definition that ECS will register."""
+        task_definition = render_task_definition(image_reference, feature_flags)
+        return (runner or RunnerSmoke()).run(
+            image_reference,
+            task_definition,
+            pr_number=self.pr_number,
+            sha=self.sha,
+            timeout_seconds=timeout_seconds,
+            diagnostics_dir=diagnostics_dir,
+        )
 
     def deploy_aws(
         self,
         dry_run: bool = False,
         feature_flags: Optional[List[Dict[str, str]]] = None,
         startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        image_reference: Optional[str] = None,
     ) -> None:
         """Deploy to AWS (atomic operation)"""
         github, aws = get_interfaces()
 
         if not dry_run:
-            result = aws.create_environment(
-                pr_number=self.pr_number,
-                sha=self.sha + "0" * (40 - len(self.sha)),  # Convert to full SHA
-                github_user=self.requested_by or "unknown",
-                feature_flags=feature_flags,
-                startup_timeout_seconds=startup_timeout_seconds,
-            )
+            create_options: Dict[str, Any] = {
+                "pr_number": self.pr_number,
+                "sha": self.sha + "0" * (40 - len(self.sha)),
+                "github_user": self.requested_by or "unknown",
+                "feature_flags": feature_flags,
+                "startup_timeout_seconds": startup_timeout_seconds,
+            }
+            if image_reference is not None:
+                create_options["image_reference"] = image_reference
+            result = aws.create_environment(**create_options)
 
             result_service_created = getattr(result, "service_created", False)
             self.service_created = (
@@ -258,17 +298,22 @@ class Show:
             result = aws.delete_environment(self.aws_service_name, self.pr_number)
         return bool(result)
 
-    def _build_docker_image(self) -> None:
+    def _build_docker_image(self, timeout_seconds: int) -> str:
         """Build Docker image for this environment"""
+        import json
         import os
-        import subprocess
+        import tempfile
 
         tag = f"apache/superset:pr-{self.pr_number}-{self.sha}-ci"
 
         # Detect if running in CI environment
         is_ci = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
 
-        # Build command without final path
+        descriptor, metadata_path = tempfile.mkstemp(
+            prefix="showtime-build-metadata-", suffix=".json"
+        )
+        os.close(descriptor)
+        os.chmod(metadata_path, 0o600)
         cmd = [
             "docker",
             "buildx",
@@ -284,6 +329,8 @@ class Show:
             "LOAD_EXAMPLES_DUCKDB=true",
             "-t",
             tag,
+            "--metadata-file",
+            metadata_path,
         ]
 
         # Add caching based on environment
@@ -323,23 +370,33 @@ class Show:
         print(f"🐳 Building Docker image: {tag}")
         print(f"🐳 Command: {' '.join(cmd)}")
 
-        # Stream output in real-time
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-
-        if process.stdout:
-            for line in process.stdout:
-                print(f"🐳 {line.rstrip()}")
-
-        return_code = process.wait(timeout=3600)
-        if return_code != 0:
-            raise Exception(f"Docker build failed with exit code: {return_code}")
+        try:
+            process = run_bounded_process(
+                cmd,
+                timeout_seconds,
+                secret_values=configured_secret_values(),
+                stream_prefix="🐳 ",
+            )
+            if not process.success:
+                if process.interrupted:
+                    raise RuntimeError("Docker build interrupted")
+                if process.timed_out:
+                    raise RuntimeError("Docker build timed out")
+                raise RuntimeError(f"Docker build failed with exit code: {process.returncode}")
+            with open(metadata_path) as metadata_file:
+                encoded = metadata_file.read(OUTPUT_METADATA_LIMIT + 1)
+            if len(encoded) > OUTPUT_METADATA_LIMIT:
+                raise RuntimeError("Docker build metadata exceeds the configured limit")
+            metadata: Dict[str, Any] = json.loads(encoded)
+            digest = metadata.get("containerimage.digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise RuntimeError("Docker build did not return a valid manifest digest")
+            return f"apache/superset@{digest}"
+        finally:
+            try:
+                os.unlink(metadata_path)
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def from_circus_labels(cls, pr_number: int, labels: List[str], sha: str) -> Optional["Show"]:

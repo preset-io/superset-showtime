@@ -111,7 +111,13 @@ def test_timeout_plumbs_from_pull_request_to_show() -> None:
         )
         stack.enter_context(patch.object(pr, "_atomic_claim", return_value=True))
         stack.enter_context(patch.object(pr, "_create_new_show", return_value=candidate))
-        stack.enter_context(patch.object(candidate, "build_docker"))
+        stack.enter_context(
+            patch.object(
+                candidate,
+                "build_docker",
+                return_value="apache/superset@sha256:" + "a" * 64,
+            )
+        )
         deploy = stack.enter_context(patch.object(candidate, "deploy_aws"))
         stack.enter_context(patch.object(pr, "set_show_status"))
         stack.enter_context(patch.object(pr, "_update_show_labels"))
@@ -131,7 +137,12 @@ def test_timeout_plumbs_from_pull_request_to_show() -> None:
         result = pr.sync("abc123f", startup_timeout_seconds=321)
 
     assert result.success is True
-    deploy.assert_called_once_with(False, feature_flags=[], startup_timeout_seconds=321)
+    deploy.assert_called_once_with(
+        False,
+        feature_flags=[],
+        startup_timeout_seconds=321,
+        image_reference="apache/superset@sha256:" + "a" * 64,
+    )
 
 
 @pytest.mark.parametrize("command", ["start", "sync"])

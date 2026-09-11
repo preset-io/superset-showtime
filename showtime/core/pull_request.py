@@ -12,6 +12,13 @@ from typing import Any, Dict, List, Optional
 from .aws import AWSInterface
 from .github import GitHubInterface
 from .readiness import DEFAULT_STARTUP_TIMEOUT_SECONDS, validate_startup_timeout_seconds
+from .runner_smoke import (
+    DEFAULT_BUILD_TIMEOUT_SECONDS,
+    DEFAULT_DIAGNOSTICS_DIR,
+    DEFAULT_SMOKE_TIMEOUT_SECONDS,
+    validate_diagnostics_directory,
+    validate_positive_seconds,
+)
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -659,6 +666,10 @@ class PullRequest:
         dry_run_aws: bool = False,
         dry_run_docker: bool = False,
         startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        smoke_test: bool = False,
+        smoke_timeout_seconds: int = DEFAULT_SMOKE_TIMEOUT_SECONDS,
+        build_timeout_seconds: int = DEFAULT_BUILD_TIMEOUT_SECONDS,
+        smoke_diagnostics_dir: str = DEFAULT_DIAGNOSTICS_DIR,
     ) -> SyncResult:
         """Sync PR to desired state while preserving truthful lifecycle state.
 
@@ -677,6 +688,13 @@ class PullRequest:
             Exception: On unrecoverable errors (caller should handle)
         """
         startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
+        smoke_timeout_seconds = validate_positive_seconds(smoke_timeout_seconds, "smoke timeout")
+        build_timeout_seconds = validate_positive_seconds(build_timeout_seconds, "build timeout")
+        smoke_diagnostics_dir = str(validate_diagnostics_directory(smoke_diagnostics_dir))
+        if dry_run_docker and not dry_run_aws:
+            raise ValueError("--dry-run-docker requires --dry-run-aws")
+        if dry_run_docker and smoke_test:
+            raise ValueError("runner smoke cannot be enabled when Docker is skipped")
 
         action_needed = self._determine_action(target_sha, dry_run_github)
         target_sha_short = short_sha(target_sha)
@@ -757,13 +775,35 @@ class PullRequest:
         try:
             print(f"🏗️ Creating environment {candidate.sha}...")
             self._best_effort_comment(self._post_building_comment, candidate, dry_run_github)
-            candidate.build_docker(dry_run_docker)
+            if build_timeout_seconds == DEFAULT_BUILD_TIMEOUT_SECONDS:
+                built_reference = candidate.build_docker(dry_run_docker)
+            else:
+                built_reference = candidate.build_docker(
+                    dry_run_docker, build_timeout_seconds=build_timeout_seconds
+                )
+            image_reference = None if dry_run_docker else built_reference
+            if not dry_run_docker and image_reference is None:
+                raise RuntimeError("Docker build did not produce an immutable image reference")
+            if smoke_test:
+                if image_reference is None:
+                    raise RuntimeError("runner smoke requires an immutable image reference")
+                smoke = candidate.run_smoke(
+                    image_reference,
+                    feature_flags=feature_flags,
+                    timeout_seconds=smoke_timeout_seconds,
+                    diagnostics_dir=smoke_diagnostics_dir,
+                )
+                if not smoke.success:
+                    evidence = ", ".join(smoke.artifact_paths) or "no artifact was written"
+                    raise RuntimeError(f"Runner smoke failed: {smoke.error}; evidence: {evidence}")
             self.set_show_status(candidate, "deploying", dry_run_github)
-            candidate.deploy_aws(
-                dry_run_aws,
-                feature_flags=feature_flags,
-                startup_timeout_seconds=startup_timeout_seconds,
-            )
+            deploy_options: Dict[str, Any] = {
+                "feature_flags": feature_flags,
+                "startup_timeout_seconds": startup_timeout_seconds,
+            }
+            if image_reference is not None:
+                deploy_options["image_reference"] = image_reference
+            candidate.deploy_aws(dry_run_aws, **deploy_options)
             self.set_show_status(candidate, "running", dry_run_github)
             self._update_show_labels(candidate, dry_run_github)
 
