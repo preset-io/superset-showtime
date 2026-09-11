@@ -9,10 +9,25 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import boto3  # type: ignore[import-untyped]
+import httpx
+from botocore.config import Config
+
+from .readiness import (
+    DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DIAGNOSTIC_TIMEOUT_SECONDS,
+    SDK_REQUEST_ENVELOPE_SECONDS,
+    DiagnosticSummary,
+    ECSReadinessObserver,
+    StartupBudget,
+    _error_code,
+    configured_secret_values,
+    validate_startup_timeout_seconds,
+)
 
 # Module logger for machine-readable events (separate from CLI print statements)
 logger = logging.getLogger(__name__)
@@ -41,6 +56,7 @@ class EnvironmentResult:
     error: Optional[str] = None
     task_definition_arn: Optional[str] = None
     service_created: Optional[bool] = False
+    diagnostic: Optional[DiagnosticSummary] = None
 
 
 class AWSInterface:
@@ -55,6 +71,13 @@ class AWSInterface:
         ecs_client: Optional[Any] = None,
         ecr_client: Optional[Any] = None,
         ec2_client: Optional[Any] = None,
+        logs_client: Optional[Any] = None,
+        startup_client_factory: Optional[Callable[[str, Config], Any]] = None,
+        http_client_factory: Optional[Callable[[], Any]] = None,
+        readiness_observer_factory: Callable[..., ECSReadinessObserver] = ECSReadinessObserver,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.region = region or os.getenv("AWS_REGION", "us-west-2")
         self.cluster = cluster or os.getenv("ECS_CLUSTER", "superset-ci")
@@ -64,6 +87,16 @@ class AWSInterface:
         self.ecs_client = ecs_client or boto3.client("ecs", region_name=self.region)
         self.ecr_client = ecr_client or boto3.client("ecr", region_name=self.region)
         self.ec2_client = ec2_client or boto3.client("ec2", region_name=self.region)
+        self.logs_client = logs_client
+        self._ecs_injected = ecs_client is not None
+        self._ec2_injected = ec2_client is not None
+        self._logs_injected = logs_client is not None
+        self._startup_client_factory = startup_client_factory or self._create_startup_client
+        self._http_client_factory = http_client_factory or self._create_http_client
+        self._readiness_observer_factory = readiness_observer_factory
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self._sleep = sleep
 
         # Network configuration (from current GHA)
         self.subnets = ["subnet-0e15a5034b4121710", "subnet-0e8efef4a72224974"]
@@ -77,6 +110,7 @@ class AWSInterface:
         feature_flags: Optional[List[Dict[str, str]]] = None,
         image_tag_override: Optional[str] = None,
         force: bool = False,
+        startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> EnvironmentResult:
         """
         Create ephemeral environment (replaces any existing service with same name)
@@ -88,6 +122,8 @@ class AWSInterface:
         4. Deploy and wait for stability
         5. Health check and return IP
         """
+
+        startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
 
         # Create Show object for consistent AWS naming
         from .date_utils import format_utc_now
@@ -104,6 +140,9 @@ class AWSInterface:
         service_name = show.ecs_service_name  # pr-{pr_number}-{sha}-service
         task_def_arn: Optional[str] = None
         service_created: Optional[bool] = False
+        observer: Optional[ECSReadinessObserver] = None
+        startup_budget: Optional[StartupBudget] = None
+        startup_http: Optional[Any] = None
 
         def result(success: bool, **kwargs: Any) -> EnvironmentResult:
             """Build a result that always carries known candidate identity state."""
@@ -115,7 +154,38 @@ class AWSInterface:
                 **kwargs,
             )
 
+        def failure(
+            error: str, diagnostic: Optional[DiagnosticSummary] = None
+        ) -> EnvironmentResult:
+            """Capture bounded diagnostics before handing a failed candidate back."""
+            if service_created is not False and observer is not None and startup_budget is not None:
+                try:
+                    diagnostic_budget = StartupBudget(
+                        DIAGNOSTIC_TIMEOUT_SECONDS, self._monotonic, self._wall_clock
+                    )
+                    diagnostic = observer.capture_failure(error, startup_budget, diagnostic_budget)
+                except Exception as exc:
+                    if diagnostic is None:
+                        diagnostic = DiagnosticSummary(
+                            service_name=service_name,
+                            expected_task_definition_arn=task_def_arn,
+                            elapsed_seconds=startup_budget.elapsed,
+                            primary_error=error,
+                        )
+                    diagnostic.capture_errors.append(
+                        f"diagnostic capture failed:{type(exc).__name__}"
+                    )
+            return result(False, error=error, diagnostic=diagnostic)
+
         try:
+            # Validate injected transport limits before registration or teardown.
+            for injected, client, service in (
+                (self._ecs_injected, self.ecs_client, "ECS"),
+                (self._ec2_injected, self.ec2_client, "EC2"),
+                (self._logs_injected, self.logs_client, "Logs"),
+            ):
+                if injected:
+                    self._validate_injected_startup_client(client, service)
             # Handle force flag - delete existing service for this SHA first
             if force:
                 print(f"🗑️ Force flag: Checking for existing service {service_name}")
@@ -175,39 +245,160 @@ class AWSInterface:
                         "Service may still be DRAINING. Retry after a few minutes.",
                     )
 
-            # Step 4: Create fresh service
+            # Step 4: Begin one budget immediately before candidate creation.
+            startup_budget = StartupBudget(
+                startup_timeout_seconds, self._monotonic, self._wall_clock
+            )
+            startup_ecs, startup_ec2, startup_logs = self._get_startup_clients(startup_budget)
+            startup_http = self._http_client_factory()
+            observer = self._readiness_observer_factory(
+                ecs_client=startup_ecs,
+                ec2_client=startup_ec2,
+                logs_client=startup_logs,
+                cluster=self.cluster,
+                http_client=startup_http,
+                monotonic=self._monotonic,
+                wall_clock=self._wall_clock,
+                sleep=self._sleep,
+                secret_values=configured_secret_values(feature_flags),
+            )
+            observer.set_candidate(service_name, task_def_arn)
+
+            # Step 5: Create fresh service.
             print(f"🆕 Creating service: {service_name}")
+            startup_budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "CreateService")
             service_created = None
-            success = self._create_ecs_service(service_name, pr_number, github_user, task_def_arn)
+            success = self._create_ecs_service(
+                service_name,
+                pr_number,
+                github_user,
+                task_def_arn,
+                ecs_client=startup_ecs,
+                on_error=observer.record_api_error,
+            )
             if not success:
-                return result(False, error="Service creation failed")
+                return failure("Service creation failed")
             service_created = True
+            startup_budget.reject_late_result("CreateService")
 
-            # Step 5: Deploy task definition to green service
-            success = self._deploy_task_definition(service_name, task_def_arn)
+            # Step 6: Deploy through the same bounded client and budget.
+            startup_budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "UpdateService")
+            success = self._deploy_task_definition(
+                service_name,
+                task_def_arn,
+                ecs_client=startup_ecs,
+                on_error=observer.record_api_error,
+            )
             if not success:
-                return result(False, error="Green task definition deployment failed")
+                return failure("Green task definition deployment failed")
+            startup_budget.reject_late_result("UpdateService")
 
-            # Step 6: Wait for service stability (replicate GHA wait-for-service-stability)
-            print(f"⏳ Waiting for service {service_name} to become stable...")
-            if not self._wait_for_service_stability(service_name):
-                return result(False, error="Service failed to become stable")
-
-            # Step 7: Health check the new service (longer timeout for Superset + examples)
-            # Note: Superset example loading takes more tha 10 mins in some cases
-            print(f"🏥 Health checking service {service_name}...")
-            if not self._health_check_service(service_name, max_attempts=30):  # 15 minutes total
-                return result(False, error="Service failed health checks")
-
-            # Step 8: Get IP after health checks pass
-            ip = self.get_environment_ip(service_name)
-            if not ip:
-                return result(False, error="Failed to get environment IP")
-
-            return result(True, ip=ip)
+            # Step 7: Observe exact ECS identity and strict /health together.
+            print(f"⏳ Waiting for strict readiness of {service_name}...")
+            readiness = observer.wait(service_name, task_def_arn, startup_budget)
+            if not readiness.success:
+                return failure(
+                    readiness.error or "Service failed strict startup readiness",
+                    readiness.diagnostic,
+                )
+            return result(True, ip=readiness.ip)
 
         except Exception as e:
-            return result(False, error=str(e))
+            return failure(f"Startup failed ({_error_code(e)})")
+        finally:
+            if startup_http is not None:
+                try:
+                    startup_http.close()
+                except Exception:
+                    pass
+
+    def _create_startup_client(self, service: str, config: Config) -> Any:
+        """Create one production startup client with finite transport limits."""
+        if service == "ecs":
+            return boto3.client("ecs", region_name=self.region, config=config)
+        if service == "ec2":
+            return boto3.client("ec2", region_name=self.region, config=config)
+        if service == "logs":
+            return boto3.client("logs", region_name=self.region, config=config)
+        raise ValueError("unsupported startup client")
+
+    @staticmethod
+    def _create_http_client() -> httpx.Client:
+        """Create a strict streaming HTTP client with a seven-second envelope."""
+        return httpx.Client(
+            timeout=httpx.Timeout(connect=2, read=3, write=1, pool=1),
+            follow_redirects=False,
+        )
+
+    @staticmethod
+    def _validate_injected_startup_client(client: Any, service: str) -> Any:
+        """Require SDK-backed injected clients to use equivalent or tighter limits."""
+        meta = getattr(client, "meta", None)
+        config = getattr(meta, "config", None)
+        if not isinstance(config, Config):
+            return client
+        limits = vars(config)
+        retries = limits.get("retries") or {}
+        attempts = retries.get("total_max_attempts")
+        if attempts is None and "max_attempts" in retries:
+            attempts = retries["max_attempts"] + 1
+        if (
+            limits.get("connect_timeout", 60) > 2
+            or limits.get("read_timeout", 60) > 5
+            or attempts is None
+            or attempts > 1
+        ):
+            raise ValueError(
+                f"injected {service} startup client must use equivalent or tighter "
+                "transport limits (connect<=2, read<=5, total_max_attempts<=1)"
+            )
+        return client
+
+    def _get_startup_clients(
+        self, budget: Optional[StartupBudget] = None
+    ) -> Tuple[Any, Any, Optional[Any]]:
+        """Return dedicated bounded startup clients without changing cleanup clients."""
+        config = Config(
+            connect_timeout=2,
+            read_timeout=5,
+            retries={"total_max_attempts": 1, "mode": "standard"},
+        )
+
+        def create_client(service: str) -> Any:
+            """Charge setup time to the same startup budget before dispatch."""
+            if budget is not None:
+                budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "startup client setup")
+            client = self._startup_client_factory(service, config)
+            if budget is not None:
+                budget.reject_late_result("startup client setup")
+            return client
+
+        ecs_config = getattr(getattr(self.ecs_client, "meta", None), "config", None)
+        ec2_config = getattr(getattr(self.ec2_client, "meta", None), "config", None)
+        ecs = (
+            self._validate_injected_startup_client(self.ecs_client, "ECS")
+            if self._ecs_injected or not isinstance(ecs_config, Config)
+            else create_client("ecs")
+        )
+        ec2 = (
+            self._validate_injected_startup_client(self.ec2_client, "EC2")
+            if self._ec2_injected or not isinstance(ec2_config, Config)
+            else create_client("ec2")
+        )
+        if self._logs_injected:
+            logs = self._validate_injected_startup_client(self.logs_client, "Logs")
+        elif (
+            self._ecs_injected
+            or self._ec2_injected
+            or not isinstance(ecs_config, Config)
+            or not isinstance(ec2_config, Config)
+        ):
+            logs = None
+        else:
+            logs = create_client("logs")
+        if budget is not None:
+            budget.reject_late_result("startup client setup")
+        return ecs, ec2, logs
 
     def delete_environment(
         self,
@@ -450,14 +641,22 @@ class AWSInterface:
             return str(task_def_arn)
 
         except Exception as e:
-            print(f"❌ Task definition creation failed: {e}")
+            print(f"❌ Task definition creation failed: {_error_code(e)}")
             return None
 
-    def _deploy_task_definition(self, service_name: str, task_def_arn: str) -> bool:
+    def _deploy_task_definition(
+        self,
+        service_name: str,
+        task_def_arn: str,
+        *,
+        ecs_client: Optional[Any] = None,
+        on_error: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """Deploy task definition to service (replicate GHA deploy-task step)"""
         try:
             # Replicate exact GHA deploy-task-definition parameters
-            self.ecs_client.update_service(
+            client = ecs_client or self.ecs_client
+            client.update_service(
                 cluster=self.cluster, service=service_name, taskDefinition=task_def_arn
             )
 
@@ -465,7 +664,9 @@ class AWSInterface:
             return True
 
         except Exception as e:
-            print(f"❌ Task definition deployment failed: {e}")
+            if on_error is not None:
+                on_error("UpdateService", _error_code(e))
+            print(f"❌ Task definition deployment failed: {_error_code(e)}")
             return False
 
     def _service_exists(self, service_name: str) -> bool:
@@ -536,12 +737,20 @@ class AWSInterface:
             return True
 
     def _create_ecs_service(
-        self, service_name: str, pr_number: int, github_user: str, task_def_arn: str
+        self,
+        service_name: str,
+        pr_number: int,
+        github_user: str,
+        task_def_arn: str,
+        *,
+        ecs_client: Optional[Any] = None,
+        on_error: Optional[Callable[[str, str], None]] = None,
     ) -> bool:
         """Create ECS service (replicate exact GHA create-service step)"""
         try:
             # Replicate exact GHA create-service command parameters
-            self.ecs_client.create_service(
+            client = ecs_client or self.ecs_client
+            client.create_service(
                 cluster=self.cluster,
                 serviceName=service_name,  # pr-{pr_number}-service
                 taskDefinition=task_def_arn,  # Use our custom task definition with env vars
@@ -571,7 +780,9 @@ class AWSInterface:
             return True
 
         except Exception as e:
-            print(f"❌ ECS service creation failed: {e}")
+            if on_error is not None:
+                on_error("CreateService", _error_code(e))
+            print(f"❌ ECS service creation failed: {_error_code(e)}")
             return False
 
     def _wait_for_deployment_and_get_ip(
@@ -590,7 +801,7 @@ class AWSInterface:
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
+                WaiterConfig={"Delay": 30, "MaxAttempts": timeout_minutes * 2},
             )
 
             # Get IP after deployment is stable
@@ -967,7 +1178,7 @@ class AWSInterface:
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
+                WaiterConfig={"Delay": 30, "MaxAttempts": timeout_minutes * 2},
             )
 
             print(f"✅ Service {service_name} is stable")
@@ -978,7 +1189,7 @@ class AWSInterface:
             return False
 
     def _health_check_service(self, service_name: str, max_attempts: int = 6) -> bool:
-        """Health check service by testing HTTP response"""
+        """Compatibility helper that accepts only a strict streaming /health 200."""
         import time
 
         import httpx
@@ -995,24 +1206,21 @@ class AWSInterface:
                     continue
 
                 health_url = f"http://{ip}:8080/health"  # Superset health endpoint
-                fallback_url = f"http://{ip}:8080/"  # Fallback to main page
 
                 try:
-                    with httpx.Client(timeout=10.0) as client:
-                        # Try health endpoint first
+                    with httpx.Client(
+                        timeout=httpx.Timeout(connect=2, read=3, write=1, pool=1),
+                        follow_redirects=False,
+                    ) as client:
                         try:
-                            response = client.get(health_url)
-                            if response.status_code == 200:
-                                print(f"✅ Health check passed on attempt {attempt + 1}")
-                                return True
+                            with client.stream(
+                                "GET", health_url, follow_redirects=False
+                            ) as response:
+                                if response.status_code == 200:
+                                    print(f"✅ Health check passed on attempt {attempt + 1}")
+                                    return True
                         except httpx.RequestError:
                             pass
-
-                        # Fallback to main page
-                        response = client.get(fallback_url)
-                        if response.status_code == 200:
-                            print(f"✅ Health check passed (main page) on attempt {attempt + 1}")
-                            return True
 
                 except Exception as e:
                     print(f"⚠️ Health check attempt {attempt + 1} failed: {e}")

@@ -16,6 +16,7 @@ from .core.github_messages import (
     get_aws_console_urls,
 )
 from .core.pull_request import PullRequest
+from .core.readiness import DEFAULT_STARTUP_TIMEOUT_SECONDS, validate_startup_timeout_seconds
 from .core.show import Show
 
 # Constants
@@ -234,9 +235,16 @@ def start(
     force: bool = typer.Option(
         False, "--force", help="Force re-deployment by deleting existing service"
     ),
+    startup_timeout_seconds: int = typer.Option(
+        DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        "--startup-timeout-seconds",
+        envvar="SHOWTIME_STARTUP_TIMEOUT_SECONDS",
+        help="Overall ECS startup readiness budget in seconds",
+    ),
 ) -> None:
     """Create ephemeral environment for PR"""
     try:
+        startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
         pr = PullRequest.from_id(pr_number)
 
         # Check if working environment already exists (unless force)
@@ -269,7 +277,12 @@ def start(
             return
 
         # Use PullRequest method for all logic
-        result = pr.start_environment(sha=sha, dry_run_github=False, dry_run_aws=dry_run_aws)
+        result = pr.start_environment(
+            sha=sha,
+            dry_run_github=False,
+            dry_run_aws=dry_run_aws,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
 
         if result.success:
             if result.show:
@@ -658,9 +671,16 @@ def sync(
     docker_tag: Optional[str] = typer.Option(
         None, "--docker-tag", help="Override Docker image tag (e.g., pr-34639-9a82c20-ci, latest)"
     ),
+    startup_timeout_seconds: int = typer.Option(
+        DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        "--startup-timeout-seconds",
+        envvar="SHOWTIME_STARTUP_TIMEOUT_SECONDS",
+        help="Overall ECS startup readiness budget in seconds",
+    ),
 ) -> None:
     """🎪 Intelligently sync PR to desired state (called by GitHub Actions)"""
     try:
+        startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
         # Validate required Git SHA unless using --check-only
         if not check_only:
             from .core.git_validation import (
@@ -723,6 +743,7 @@ def sync(
             dry_run_github=dry_run_github,
             dry_run_aws=dry_run_aws,
             dry_run_docker=dry_run_docker,
+            startup_timeout_seconds=startup_timeout_seconds,
         )
 
         if result.success:

@@ -199,6 +199,55 @@ Per-PR teardown only detaches labels. Repository-wide label definitions may be
 shared by other PRs and are deleted exclusively by `cleanup-labels` after a global
 attachment-count check.
 
+## Startup readiness and diagnostics
+
+`start` and `sync` accept `--startup-timeout-seconds`, or
+`SHOWTIME_STARTUP_TIMEOUT_SECONDS`. The default is 1800 seconds (30 minutes);
+values must be positive integers and are validated before deployment changes.
+
+```bash
+showtime sync PR_NUMBER --sha SHA --startup-timeout-seconds 1800
+```
+
+After task-definition registration and any required same-SHA teardown, one
+monotonic startup budget covers dedicated client setup, service creation, update,
+task observation, networking, and HTTP health checks. Task
+replacement does not reset it. Success requires the expected task definition,
+one stable primary deployment with matching running/desired counts and no
+pending tasks, and `/health` returning HTTP 200 from that deployment's running
+task. An incomplete or failed rollout cannot pass just because HTTP responds;
+there is no homepage or redirect fallback.
+
+Showtime reports task, endpoint, and service-state changes while waiting. A
+stopped task can be replaced within the original budget. Failed rollouts and
+terminal service states fail promptly. Newly created service/task/network
+identities get a bounded visibility allowance of up to five minutes, constrained
+by the original deadline; permission errors are not treated as visibility delays.
+Historical task records cannot establish current readiness, and historical scans
+do not delay a candidate that has already passed strict health. After a failed
+probe, historical collection has a 15-second per-cycle cap and reserves time for
+the next live poll; incomplete history is reported as partial evidence.
+
+Startup AWS requests use 2-second connect and 5-second read timeouts with SDK
+retries disabled. HTTP uses a streaming response and finite timeouts without
+reading the body. A request is not started with less than its 7-second transport
+allowance remaining. These are practical request bounds, not an unconditional
+process kill: DNS, credential providers, and OS scheduling can affect elapsed
+time. The longer default is a mitigation, not a diagnosis of slow application
+startup.
+
+Before failed-candidate cleanup, Showtime collects bounded service/task evidence,
+including exit codes, stop reasons, replacements, and recent service events.
+An additional 30-second diagnostic budget permits at most one CloudWatch log
+page (100 events), with log content limited to 100 lines and 16 KiB. Log access
+uses the packaged ECS log configuration and requires optional `logs:GetLogEvents`
+permission on that log group. Available, empty, denied, unavailable, and
+not-attempted logs are reported distinctly. Known configured secret values are
+redacted; raw task environments and AWS exception payloads are not printed.
+Diagnostic failures cannot suppress candidate cleanup or erase the primary
+failure. Total command time can exceed the startup budget by this diagnostic
+allowance and the existing bounded cleanup waits.
+
 ## 🔒 Security & Permissions
 
 ### Who Can Use This?

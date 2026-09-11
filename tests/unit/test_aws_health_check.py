@@ -28,7 +28,7 @@ class TestHealthCheckRetries:
         with patch.object(aws, "get_environment_ip", return_value="1.2.3.4"):
             with patch("httpx.Client") as mock_client:
                 mock_response = MagicMock(status_code=200)
-                mock_client.return_value.__enter__.return_value.get.return_value = mock_response
+                mock_client.return_value.__enter__.return_value.stream.return_value.__enter__.return_value = mock_response
 
                 assert aws._health_check_service("test-service", max_attempts=3) is True
 
@@ -37,11 +37,13 @@ class TestHealthCheckRetries:
         with patch.object(aws, "get_environment_ip", return_value="1.2.3.4"):
             with patch("httpx.Client") as mock_client:
                 mock_instance = mock_client.return_value.__enter__.return_value
-                # Fail twice (health + fallback each), then succeed
-                mock_instance.get.side_effect = [
-                    httpx.RequestError("refused"), MagicMock(status_code=503),  # attempt 1
-                    httpx.RequestError("refused"), MagicMock(status_code=503),  # attempt 2
-                    MagicMock(status_code=200),  # attempt 3 succeeds
+                mock_instance.stream.side_effect = [
+                    httpx.RequestError("refused"),
+                    httpx.RequestError("refused"),
+                    MagicMock(
+                        __enter__=MagicMock(return_value=MagicMock(status_code=200)),
+                        __exit__=MagicMock(return_value=None),
+                    ),
                 ]
 
                 with patch("time.sleep"):
@@ -51,7 +53,7 @@ class TestHealthCheckRetries:
         """Returns False after all attempts fail"""
         with patch.object(aws, "get_environment_ip", return_value="1.2.3.4"):
             with patch("httpx.Client") as mock_client:
-                mock_client.return_value.__enter__.return_value.get.side_effect = (
+                mock_client.return_value.__enter__.return_value.stream.side_effect = (
                     httpx.RequestError("refused")
                 )
 

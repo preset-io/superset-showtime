@@ -9,6 +9,13 @@ from datetime import datetime
 from hashlib import sha256
 from typing import Dict, List, Optional
 
+from .readiness import (
+    DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DiagnosticSummary,
+    configured_secret_values,
+    render_diagnostic_summary,
+)
+
 
 # Import interfaces for singleton access
 # Note: These will be imported when the module loads, creating singletons
@@ -39,6 +46,7 @@ class Show:
     task_definition_fingerprint: Optional[str] = None
     service_created: Optional[bool] = False
     cleanup_pending: bool = False
+    diagnostic: Optional[DiagnosticSummary] = None
     # Note: TTL is now managed at PR-level, not per-Show. See PullRequest.get_pr_ttl_hours()
 
     def __post_init__(self) -> None:
@@ -160,6 +168,7 @@ class Show:
         self,
         dry_run: bool = False,
         feature_flags: Optional[List[Dict[str, str]]] = None,
+        startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> None:
         """Deploy to AWS (atomic operation)"""
         github, aws = get_interfaces()
@@ -170,6 +179,7 @@ class Show:
                 sha=self.sha + "0" * (40 - len(self.sha)),  # Convert to full SHA
                 github_user=self.requested_by or "unknown",
                 feature_flags=feature_flags,
+                startup_timeout_seconds=startup_timeout_seconds,
             )
 
             result_service_created = getattr(result, "service_created", False)
@@ -191,7 +201,21 @@ class Show:
                 )
                 self.cleanup_pending = False
 
+            result_diagnostic = getattr(result, "diagnostic", None)
+            self.diagnostic = (
+                result_diagnostic if isinstance(result_diagnostic, DiagnosticSummary) else None
+            )
+
             if not result.success:
+                if self.diagnostic is not None:
+                    try:
+                        print(
+                            render_diagnostic_summary(
+                                self.diagnostic, configured_secret_values(feature_flags)
+                            )
+                        )
+                    except Exception as exc:
+                        print("⚠️ Startup diagnostic rendering failed: " f"{type(exc).__name__}")
                 raise Exception(f"AWS deployment failed: {result.error}")
 
             # Update with deployment results

@@ -22,9 +22,7 @@ class TestParseFeatureFlags:
 
     def test_single_flag(self) -> None:
         result = parse_feature_flags("FEATURE_DASHBOARD_NATIVE_FILTERS=true")
-        assert result == [
-            {"name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS", "value": "True"}
-        ]
+        assert result == [{"name": "SUPERSET_FEATURE_DASHBOARD_NATIVE_FILTERS", "value": "True"}]
 
     def test_multiple_flags(self) -> None:
         description = """
@@ -132,9 +130,7 @@ class TestFeatureFlagsInSync:
                 with patch.object(pr, "_post_building_comment"):
                     with patch.object(pr, "_update_show_labels"):
                         with patch.object(pr, "_post_success_comment"):
-                            mock_show = Show(
-                                pr_number=1234, sha="abc123f", status="building"
-                            )
+                            mock_show = Show(pr_number=1234, sha="abc123f", status="building")
                             mock_create.return_value = mock_show
                             mock_show.build_docker = Mock()  # type: ignore[method-assign]
                             mock_show.deploy_aws = Mock()  # type: ignore[method-assign]
@@ -154,21 +150,19 @@ class TestFeatureFlagsInSync:
                                 }
                             ]
                             mock_show.deploy_aws.assert_called_once_with(
-                                True, feature_flags=expected_flags
+                                True,
+                                feature_flags=expected_flags,
+                                startup_timeout_seconds=1800,
                             )
 
     @patch("showtime.core.pull_request.get_github")
-    def test_sync_empty_flags_when_no_flags_in_description(
-        self, mock_get_github: Mock
-    ) -> None:
+    def test_sync_empty_flags_when_no_flags_in_description(self, mock_get_github: Mock) -> None:
         """No feature flags in description results in empty list passed to deploy"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
 
         mock_github.get_labels.return_value = ["🎪 ⚡ showtime-trigger-start"]
-        mock_github.get_pr_data.return_value = {
-            "body": "Regular PR, no feature flags"
-        }
+        mock_github.get_pr_data.return_value = {"body": "Regular PR, no feature flags"}
 
         pr = PullRequest(1234, ["🎪 ⚡ showtime-trigger-start"])
 
@@ -177,9 +171,7 @@ class TestFeatureFlagsInSync:
                 with patch.object(pr, "_post_building_comment"):
                     with patch.object(pr, "_update_show_labels"):
                         with patch.object(pr, "_post_success_comment"):
-                            mock_show = Show(
-                                pr_number=1234, sha="abc123f", status="building"
-                            )
+                            mock_show = Show(pr_number=1234, sha="abc123f", status="building")
                             mock_create.return_value = mock_show
                             mock_show.build_docker = Mock()  # type: ignore[method-assign]
                             mock_show.deploy_aws = Mock()  # type: ignore[method-assign]
@@ -192,7 +184,7 @@ class TestFeatureFlagsInSync:
                             )
 
                             mock_show.deploy_aws.assert_called_once_with(
-                                True, feature_flags=[]
+                                True, feature_flags=[], startup_timeout_seconds=1800
                             )
 
     @patch("showtime.core.pull_request.get_aws")
@@ -254,9 +246,7 @@ class TestFeatureFlagsInSync:
             "🎪 🎯 abc123f",
         ]
         mock_github.get_labels.return_value = labels
-        mock_github.get_pr_data.return_value = {
-            "body": "FEATURE_ALERTS=true"
-        }
+        mock_github.get_pr_data.return_value = {"body": "FEATURE_ALERTS=true"}
         # Current flags already match desired
         mock_aws.get_current_feature_flags.return_value = {
             "SUPERSET_FEATURE_ALERTS": "True",
@@ -272,9 +262,7 @@ class TestFeatureFlagsInSync:
 
     @patch("showtime.core.pull_request.get_aws")
     @patch("showtime.core.pull_request.get_github")
-    def test_sync_no_flags_skips_ecs_calls(
-        self, mock_get_github: Mock, mock_get_aws: Mock
-    ) -> None:
+    def test_sync_no_flags_skips_ecs_calls(self, mock_get_github: Mock, mock_get_aws: Mock) -> None:
         """When PR has no flags, skip ECS API calls entirely (no unnecessary cost)"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
@@ -286,9 +274,7 @@ class TestFeatureFlagsInSync:
             "🎪 🎯 abc123f",
         ]
         mock_github.get_labels.return_value = labels
-        mock_github.get_pr_data.return_value = {
-            "body": "No feature flags here"
-        }
+        mock_github.get_pr_data.return_value = {"body": "No feature flags here"}
 
         pr = PullRequest(1234, labels)
 
@@ -302,9 +288,7 @@ class TestFeatureFlagsInSync:
 
     @patch("showtime.core.pull_request.get_aws")
     @patch("showtime.core.pull_request.get_github")
-    def test_sync_removes_partial_flags(
-        self, mock_get_github: Mock, mock_get_aws: Mock
-    ) -> None:
+    def test_sync_removes_partial_flags(self, mock_get_github: Mock, mock_get_aws: Mock) -> None:
         """Removing one flag from PR description removes it from running env"""
         mock_github = Mock()
         mock_get_github.return_value = mock_github
@@ -317,9 +301,7 @@ class TestFeatureFlagsInSync:
         ]
         mock_github.get_labels.return_value = labels
         # Only ALERTS remains in description, EMBEDDED was removed
-        mock_github.get_pr_data.return_value = {
-            "body": "FEATURE_ALERTS=true"
-        }
+        mock_github.get_pr_data.return_value = {"body": "FEATURE_ALERTS=true"}
         # ECS still has both flags
         mock_aws.get_current_feature_flags.return_value = {
             "SUPERSET_FEATURE_ALERTS": "True",
@@ -355,9 +337,7 @@ class TestFeatureFlagsInSync:
                 with patch.object(pr, "_post_building_comment"):
                     with patch.object(pr, "_update_show_labels"):
                         with patch.object(pr, "_post_success_comment"):
-                            mock_show = Show(
-                                pr_number=1234, sha="abc123f", status="building"
-                            )
+                            mock_show = Show(pr_number=1234, sha="abc123f", status="building")
                             mock_create.return_value = mock_show
                             mock_show.build_docker = Mock()  # type: ignore[method-assign]
                             mock_show.deploy_aws = Mock()  # type: ignore[method-assign]
@@ -372,7 +352,7 @@ class TestFeatureFlagsInSync:
                             assert result.success is True
                             # Should pass empty flags when PR data fetch fails
                             mock_show.deploy_aws.assert_called_once_with(
-                                True, feature_flags=[]
+                                True, feature_flags=[], startup_timeout_seconds=1800
                             )
 
 
@@ -397,6 +377,7 @@ class TestShowDeployAwsFeatureFlags:
             sha="abc123f" + "0" * 33,
             github_user="unknown",
             feature_flags=flags,
+            startup_timeout_seconds=1800,
         )
 
     @patch("showtime.core.show.get_interfaces")
@@ -416,6 +397,7 @@ class TestShowDeployAwsFeatureFlags:
             sha="abc123f" + "0" * 33,
             github_user="unknown",
             feature_flags=None,
+            startup_timeout_seconds=1800,
         )
 
     @patch("showtime.core.show.get_interfaces")

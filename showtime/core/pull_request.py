@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
 from .github import GitHubInterface
+from .readiness import DEFAULT_STARTUP_TIMEOUT_SECONDS, validate_startup_timeout_seconds
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
 
@@ -657,6 +658,7 @@ class PullRequest:
         dry_run_github: bool = False,
         dry_run_aws: bool = False,
         dry_run_docker: bool = False,
+        startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> SyncResult:
         """Sync PR to desired state while preserving truthful lifecycle state.
 
@@ -674,6 +676,7 @@ class PullRequest:
         Raises:
             Exception: On unrecoverable errors (caller should handle)
         """
+        startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
 
         action_needed = self._determine_action(target_sha, dry_run_github)
         target_sha_short = short_sha(target_sha)
@@ -756,7 +759,11 @@ class PullRequest:
             self._best_effort_comment(self._post_building_comment, candidate, dry_run_github)
             candidate.build_docker(dry_run_docker)
             self.set_show_status(candidate, "deploying", dry_run_github)
-            candidate.deploy_aws(dry_run_aws, feature_flags=feature_flags)
+            candidate.deploy_aws(
+                dry_run_aws,
+                feature_flags=feature_flags,
+                startup_timeout_seconds=startup_timeout_seconds,
+            )
             self.set_show_status(candidate, "running", dry_run_github)
             self._update_show_labels(candidate, dry_run_github)
 

@@ -501,7 +501,9 @@ def test_pullrequest_sync_create_environment(mock_get_github: Mock) -> None:
 
                         # Verify state transitions
                         mock_show.build_docker.assert_called_once_with(True)
-                        mock_show.deploy_aws.assert_called_once_with(True, feature_flags=[])
+                        mock_show.deploy_aws.assert_called_once_with(
+                            True, feature_flags=[], startup_timeout_seconds=1800
+                        )
                         assert mock_show.status == "running"
 
 

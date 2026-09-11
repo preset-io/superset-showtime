@@ -93,7 +93,9 @@ def ecs_client_with_stubber(fake_aws_credentials):
     """
     config = Config(
         region_name="us-west-2",
-        retries={"max_attempts": 0},
+        connect_timeout=2,
+        read_timeout=5,
+        retries={"total_max_attempts": 1, "mode": "standard"},
     )
     client = boto3.client("ecs", config=config)
     stubber = Stubber(client)
@@ -113,7 +115,12 @@ def aws_with_stubbed_clients(fake_aws_credentials):
     """
     from showtime.core.aws import AWSInterface
 
-    config = Config(region_name="us-west-2", retries={"max_attempts": 0})
+    config = Config(
+        region_name="us-west-2",
+        connect_timeout=2,
+        read_timeout=5,
+        retries={"total_max_attempts": 1, "mode": "standard"},
+    )
     ecs = boto3.client("ecs", config=config)
     ecr = boto3.client("ecr", config=config)
     ec2 = boto3.client("ec2", config=config)
