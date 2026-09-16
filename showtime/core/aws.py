@@ -4,15 +4,29 @@
 Replicates the AWS logic from current GitHub Actions workflows.
 """
 
-import json
 import logging
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import boto3  # type: ignore[import-untyped]
+import httpx
+from botocore.config import Config
+
+from .readiness import (
+    DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DIAGNOSTIC_TIMEOUT_SECONDS,
+    SDK_REQUEST_ENVELOPE_SECONDS,
+    DiagnosticSummary,
+    ECSReadinessObserver,
+    StartupBudget,
+    _error_code,
+    configured_secret_values,
+    validate_startup_timeout_seconds,
+)
+from .task_definition import render_task_definition, validate_image_reference
 
 # Module logger for machine-readable events (separate from CLI print statements)
 logger = logging.getLogger(__name__)
@@ -26,6 +40,10 @@ class AWSError(Exception):
     operation: str
     resource: Optional[str] = None
 
+    def __str__(self) -> str:
+        """Return the AWS error message for logs and CLI reporting."""
+        return self.message
+
 
 @dataclass
 class EnvironmentResult:
@@ -35,6 +53,9 @@ class EnvironmentResult:
     ip: Optional[str] = None
     service_name: Optional[str] = None
     error: Optional[str] = None
+    task_definition_arn: Optional[str] = None
+    service_created: Optional[bool] = False
+    diagnostic: Optional[DiagnosticSummary] = None
 
 
 class AWSInterface:
@@ -49,6 +70,13 @@ class AWSInterface:
         ecs_client: Optional[Any] = None,
         ecr_client: Optional[Any] = None,
         ec2_client: Optional[Any] = None,
+        logs_client: Optional[Any] = None,
+        startup_client_factory: Optional[Callable[[str, Config], Any]] = None,
+        http_client_factory: Optional[Callable[[], Any]] = None,
+        readiness_observer_factory: Callable[..., ECSReadinessObserver] = ECSReadinessObserver,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.region = region or os.getenv("AWS_REGION", "us-west-2")
         self.cluster = cluster or os.getenv("ECS_CLUSTER", "superset-ci")
@@ -58,6 +86,16 @@ class AWSInterface:
         self.ecs_client = ecs_client or boto3.client("ecs", region_name=self.region)
         self.ecr_client = ecr_client or boto3.client("ecr", region_name=self.region)
         self.ec2_client = ec2_client or boto3.client("ec2", region_name=self.region)
+        self.logs_client = logs_client
+        self._ecs_injected = ecs_client is not None
+        self._ec2_injected = ec2_client is not None
+        self._logs_injected = logs_client is not None
+        self._startup_client_factory = startup_client_factory or self._create_startup_client
+        self._http_client_factory = http_client_factory or self._create_http_client
+        self._readiness_observer_factory = readiness_observer_factory
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self._sleep = sleep
 
         # Network configuration (from current GHA)
         self.subnets = ["subnet-0e15a5034b4121710", "subnet-0e8efef4a72224974"]
@@ -71,6 +109,8 @@ class AWSInterface:
         feature_flags: Optional[List[Dict[str, str]]] = None,
         image_tag_override: Optional[str] = None,
         force: bool = False,
+        startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        image_reference: Optional[str] = None,
     ) -> EnvironmentResult:
         """
         Create ephemeral environment (replaces any existing service with same name)
@@ -82,6 +122,15 @@ class AWSInterface:
         4. Deploy and wait for stability
         5. Health check and return IP
         """
+
+        startup_timeout_seconds = validate_startup_timeout_seconds(startup_timeout_seconds)
+        if image_tag_override and image_reference:
+            return EnvironmentResult(
+                False,
+                error="image tag override and immutable reference are exclusive",
+            )
+        if image_reference:
+            image_reference = validate_image_reference(image_reference)
 
         # Create Show object for consistent AWS naming
         from .date_utils import format_utc_now
@@ -96,8 +145,54 @@ class AWSInterface:
         )
 
         service_name = show.ecs_service_name  # pr-{pr_number}-{sha}-service
+        task_def_arn: Optional[str] = None
+        service_created: Optional[bool] = False
+        observer: Optional[ECSReadinessObserver] = None
+        startup_budget: Optional[StartupBudget] = None
+        startup_http: Optional[Any] = None
+
+        def result(success: bool, **kwargs: Any) -> EnvironmentResult:
+            """Build a result that always carries known candidate identity state."""
+            return EnvironmentResult(
+                success=success,
+                service_name=service_name,
+                task_definition_arn=task_def_arn,
+                service_created=service_created,
+                **kwargs,
+            )
+
+        def failure(
+            error: str, diagnostic: Optional[DiagnosticSummary] = None
+        ) -> EnvironmentResult:
+            """Capture bounded diagnostics before handing a failed candidate back."""
+            if service_created is not False and observer is not None and startup_budget is not None:
+                try:
+                    diagnostic_budget = StartupBudget(
+                        DIAGNOSTIC_TIMEOUT_SECONDS, self._monotonic, self._wall_clock
+                    )
+                    diagnostic = observer.capture_failure(error, startup_budget, diagnostic_budget)
+                except Exception as exc:
+                    if diagnostic is None:
+                        diagnostic = DiagnosticSummary(
+                            service_name=service_name,
+                            expected_task_definition_arn=task_def_arn,
+                            elapsed_seconds=startup_budget.elapsed,
+                            primary_error=error,
+                        )
+                    diagnostic.capture_errors.append(
+                        f"diagnostic capture failed:{type(exc).__name__}"
+                    )
+            return result(False, error=error, diagnostic=diagnostic)
 
         try:
+            # Validate injected transport limits before registration or teardown.
+            for injected, client, service in (
+                (self._ecs_injected, self.ecs_client, "ECS"),
+                (self._ec2_injected, self.ec2_client, "EC2"),
+                (self._logs_injected, self.logs_client, "Logs"),
+            ):
+                if injected:
+                    self._validate_injected_startup_client(client, service)
             # Handle force flag - delete existing service for this SHA first
             if force:
                 print(f"🗑️ Force flag: Checking for existing service {service_name}")
@@ -116,7 +211,10 @@ class AWSInterface:
                 else:
                     print("ℹ️ No existing service found, proceeding with new deployment")
             # Step 1: Determine which Docker image to use (DockerHub direct)
-            if image_tag_override:
+            if image_reference:
+                docker_image = image_reference
+                print(f"✅ Using immutable DockerHub image: {docker_image}")
+            elif image_tag_override:
                 # Use explicit override (can be any format)
                 docker_image = f"apache/superset:{image_tag_override}"
                 print(f"✅ Using override image: {docker_image}")
@@ -136,7 +234,7 @@ class AWSInterface:
                 docker_image, feature_flags or []
             )
             if not task_def_arn:
-                return EnvironmentResult(success=False, error="Failed to create task definition")
+                return result(False, error="Failed to create task definition")
 
             # Step 3: Clean slate - Ensure no service with this exact name exists
             # CRITICAL: Use _service_exists_any_state() which calls describe_services directly,
@@ -151,47 +249,176 @@ class AWSInterface:
                 self._delete_ecs_service(service_name)
                 print("✅ Service deletion initiated, waiting for completion...")
                 if not self._wait_for_service_deletion(service_name):
-                    return EnvironmentResult(
-                        success=False,
+                    return result(
+                        False,
                         error=f"Timeout waiting for existing service {service_name} to be deleted. "
                         "Service may still be DRAINING. Retry after a few minutes.",
                     )
 
-            # Step 4: Create fresh service
+            # Step 4: Begin one budget immediately before candidate creation.
+            startup_budget = StartupBudget(
+                startup_timeout_seconds, self._monotonic, self._wall_clock
+            )
+            startup_ecs, startup_ec2, startup_logs = self._get_startup_clients(startup_budget)
+            startup_http = self._http_client_factory()
+            observer = self._readiness_observer_factory(
+                ecs_client=startup_ecs,
+                ec2_client=startup_ec2,
+                logs_client=startup_logs,
+                cluster=self.cluster,
+                http_client=startup_http,
+                monotonic=self._monotonic,
+                wall_clock=self._wall_clock,
+                sleep=self._sleep,
+                secret_values=configured_secret_values(feature_flags),
+            )
+            observer.set_candidate(service_name, task_def_arn)
+
+            # Step 5: Create fresh service.
             print(f"🆕 Creating service: {service_name}")
-            success = self._create_ecs_service(service_name, pr_number, github_user, task_def_arn)
+            startup_budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "CreateService")
+            service_created = None
+            success = self._create_ecs_service(
+                service_name,
+                pr_number,
+                github_user,
+                task_def_arn,
+                ecs_client=startup_ecs,
+                on_error=observer.record_api_error,
+            )
             if not success:
-                return EnvironmentResult(success=False, error="Service creation failed")
+                return failure("Service creation failed")
+            service_created = True
+            startup_budget.reject_late_result("CreateService")
 
-            # Step 5: Deploy task definition to green service
-            success = self._deploy_task_definition(service_name, task_def_arn)
+            # Step 6: Deploy through the same bounded client and budget.
+            startup_budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "UpdateService")
+            success = self._deploy_task_definition(
+                service_name,
+                task_def_arn,
+                ecs_client=startup_ecs,
+                on_error=observer.record_api_error,
+            )
             if not success:
-                return EnvironmentResult(
-                    success=False, error="Green task definition deployment failed"
+                return failure("Green task definition deployment failed")
+            startup_budget.reject_late_result("UpdateService")
+
+            # Step 7: Observe exact ECS identity and strict /health together.
+            print(f"⏳ Waiting for strict readiness of {service_name}...")
+            readiness = observer.wait(service_name, task_def_arn, startup_budget)
+            if not readiness.success:
+                return failure(
+                    readiness.error or "Service failed strict startup readiness",
+                    readiness.diagnostic,
                 )
-
-            # Step 6: Wait for service stability (replicate GHA wait-for-service-stability)
-            print(f"⏳ Waiting for service {service_name} to become stable...")
-            if not self._wait_for_service_stability(service_name):
-                return EnvironmentResult(success=False, error="Service failed to become stable")
-
-            # Step 7: Health check the new service (longer timeout for Superset + examples)
-            # Note: Superset example loading takes more tha 10 mins in some cases
-            print(f"🏥 Health checking service {service_name}...")
-            if not self._health_check_service(service_name, max_attempts=30):  # 15 minutes total
-                return EnvironmentResult(success=False, error="Service failed health checks")
-
-            # Step 8: Get IP after health checks pass
-            ip = self.get_environment_ip(service_name)
-            if not ip:
-                return EnvironmentResult(success=False, error="Failed to get environment IP")
-
-            return EnvironmentResult(success=True, ip=ip, service_name=service_name)
+            return result(True, ip=readiness.ip)
 
         except Exception as e:
-            return EnvironmentResult(success=False, error=str(e))
+            return failure(f"Startup failed ({_error_code(e)})")
+        finally:
+            if startup_http is not None:
+                try:
+                    startup_http.close()
+                except Exception:
+                    pass
 
-    def delete_environment(self, base_name: str, pr_number: int) -> bool:
+    def _create_startup_client(self, service: str, config: Config) -> Any:
+        """Create one production startup client with finite transport limits."""
+        if service == "ecs":
+            return boto3.client("ecs", region_name=self.region, config=config)
+        if service == "ec2":
+            return boto3.client("ec2", region_name=self.region, config=config)
+        if service == "logs":
+            return boto3.client("logs", region_name=self.region, config=config)
+        raise ValueError("unsupported startup client")
+
+    @staticmethod
+    def _create_http_client() -> httpx.Client:
+        """Create a strict streaming HTTP client with a seven-second envelope."""
+        return httpx.Client(
+            timeout=httpx.Timeout(connect=2, read=3, write=1, pool=1),
+            follow_redirects=False,
+        )
+
+    @staticmethod
+    def _validate_injected_startup_client(client: Any, service: str) -> Any:
+        """Require SDK-backed injected clients to use equivalent or tighter limits."""
+        meta = getattr(client, "meta", None)
+        config = getattr(meta, "config", None)
+        if not isinstance(config, Config):
+            return client
+        limits = vars(config)
+        retries = limits.get("retries") or {}
+        attempts = retries.get("total_max_attempts")
+        if attempts is None and "max_attempts" in retries:
+            attempts = retries["max_attempts"] + 1
+        if (
+            limits.get("connect_timeout", 60) > 2
+            or limits.get("read_timeout", 60) > 5
+            or attempts is None
+            or attempts > 1
+        ):
+            raise ValueError(
+                f"injected {service} startup client must use equivalent or tighter "
+                "transport limits (connect<=2, read<=5, total_max_attempts<=1)"
+            )
+        return client
+
+    def _get_startup_clients(
+        self, budget: Optional[StartupBudget] = None
+    ) -> Tuple[Any, Any, Optional[Any]]:
+        """Return dedicated bounded startup clients without changing cleanup clients."""
+        config = Config(
+            connect_timeout=2,
+            read_timeout=5,
+            retries={"total_max_attempts": 1, "mode": "standard"},
+        )
+
+        def create_client(service: str) -> Any:
+            """Charge setup time to the same startup budget before dispatch."""
+            if budget is not None:
+                budget.require(SDK_REQUEST_ENVELOPE_SECONDS, "startup client setup")
+            client = self._startup_client_factory(service, config)
+            if budget is not None:
+                budget.reject_late_result("startup client setup")
+            return client
+
+        ecs_config = getattr(getattr(self.ecs_client, "meta", None), "config", None)
+        ec2_config = getattr(getattr(self.ec2_client, "meta", None), "config", None)
+        ecs = (
+            self._validate_injected_startup_client(self.ecs_client, "ECS")
+            if self._ecs_injected or not isinstance(ecs_config, Config)
+            else create_client("ecs")
+        )
+        ec2 = (
+            self._validate_injected_startup_client(self.ec2_client, "EC2")
+            if self._ec2_injected or not isinstance(ec2_config, Config)
+            else create_client("ec2")
+        )
+        if self._logs_injected:
+            logs = self._validate_injected_startup_client(self.logs_client, "Logs")
+        elif (
+            self._ecs_injected
+            or self._ec2_injected
+            or not isinstance(ecs_config, Config)
+            or not isinstance(ec2_config, Config)
+        ):
+            logs = None
+        else:
+            logs = create_client("logs")
+        if budget is not None:
+            budget.reject_late_result("startup client setup")
+        return ecs, ec2, logs
+
+    def delete_environment(
+        self,
+        base_name: str,
+        pr_number: int,
+        *,
+        expected_task_definition_arn: Optional[str] = None,
+        expected_task_definition_fingerprint: Optional[str] = None,
+        delete_image: bool = True,
+    ) -> bool:
         """
         Delete ephemeral environment
 
@@ -203,6 +430,30 @@ class AWSInterface:
             # Simple: always add -service suffix
             ecs_service_name = f"{base_name}-service"
             print(f"🗑️ Deleting ECS service: {ecs_service_name}")
+
+            ownership_required = (
+                expected_task_definition_arn is not None
+                or expected_task_definition_fingerprint is not None
+            )
+            if ownership_required:
+                state, observed_task_definition = self._inspect_service_for_deletion(
+                    ecs_service_name
+                )
+                if state == "absent":
+                    return True
+                if state != "present" or not observed_task_definition:
+                    print(f"⚠️ Refusing unverified deletion of {ecs_service_name}")
+                    return False
+
+                from .show import task_definition_fingerprint
+
+                observed_fingerprint = task_definition_fingerprint(observed_task_definition)
+                expected_fingerprint = expected_task_definition_fingerprint
+                if expected_task_definition_arn:
+                    expected_fingerprint = task_definition_fingerprint(expected_task_definition_arn)
+                if not expected_fingerprint or observed_fingerprint != expected_fingerprint:
+                    print(f"⚠️ Refusing deletion of {ecs_service_name}: ownership changed")
+                    return False
 
             # Delete ECS service with force flag (AWS will handle cleanup)
             try:
@@ -216,8 +467,14 @@ class AWSInterface:
                 print(f"❌ AWS deletion failed: {e}")
                 return False
 
+            if not self._wait_for_service_deletion(ecs_service_name):
+                print(f"⚠️ Could not confirm deletion of {ecs_service_name}")
+                return False
+
             # Try to clean up ECR image - for showtime services, tag is base_name + "-ci"
             try:
+                if not delete_image:
+                    return True
                 image_tag = f"{base_name}-ci"
                 self.ecr_client.batch_delete_image(
                     repositoryName=self.repository, imageIds=[{"imageTag": image_tag}]
@@ -231,6 +488,34 @@ class AWSInterface:
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
             return False
+
+    def _inspect_service_for_deletion(self, service_name: str) -> Tuple[str, Optional[str]]:
+        """Return present/absent/uncertain plus the observed task definition."""
+        if not self.cluster:
+            return "uncertain", None
+        try:
+            response = self.ecs_client.describe_services(
+                cluster=self.cluster, services=[service_name]
+            )
+        except self.ecs_client.exceptions.ServiceNotFoundException:
+            return "absent", None
+        except Exception as exc:
+            print(f"⚠️ Could not inspect {service_name}: {exc}")
+            return "uncertain", None
+
+        services = response.get("services", [])
+        if services:
+            service = services[0]
+            if service.get("status") == "INACTIVE":
+                return "absent", None
+            return "present", service.get("taskDefinition")
+
+        failures = response.get("failures", [])
+        if failures and all(failure.get("reason") == "MISSING" for failure in failures):
+            return "absent", None
+        if failures:
+            return "uncertain", None
+        return "absent", None
 
     def get_environment_ip(self, service_name: str) -> Optional[str]:
         """
@@ -344,19 +629,7 @@ class AWSInterface:
     ) -> Optional[str]:
         """Create ECS task definition with DockerHub image and feature flags"""
         try:
-            # Load base task definition template
-            task_def_path = Path(__file__).parent.parent / "data" / "ecs-task-definition.json"
-            with open(task_def_path) as f:
-                task_def = json.load(f)
-
-            # Use DockerHub image directly (no ECR needed)
-            # docker_image is already in format: apache/superset:abc123f-ci
-            task_def["containerDefinitions"][0]["image"] = docker_image
-
-            # Add feature flags to environment (replicate GHA jq environment update)
-            container_env = task_def["containerDefinitions"][0]["environment"]
-            for flag in feature_flags:
-                container_env.append(flag)
+            task_def = render_task_definition(docker_image, feature_flags)
 
             # Register task definition
             response = self.ecs_client.register_task_definition(**task_def)
@@ -366,14 +639,22 @@ class AWSInterface:
             return str(task_def_arn)
 
         except Exception as e:
-            print(f"❌ Task definition creation failed: {e}")
+            print(f"❌ Task definition creation failed: {_error_code(e)}")
             return None
 
-    def _deploy_task_definition(self, service_name: str, task_def_arn: str) -> bool:
+    def _deploy_task_definition(
+        self,
+        service_name: str,
+        task_def_arn: str,
+        *,
+        ecs_client: Optional[Any] = None,
+        on_error: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
         """Deploy task definition to service (replicate GHA deploy-task step)"""
         try:
             # Replicate exact GHA deploy-task-definition parameters
-            self.ecs_client.update_service(
+            client = ecs_client or self.ecs_client
+            client.update_service(
                 cluster=self.cluster, service=service_name, taskDefinition=task_def_arn
             )
 
@@ -381,7 +662,9 @@ class AWSInterface:
             return True
 
         except Exception as e:
-            print(f"❌ Task definition deployment failed: {e}")
+            if on_error is not None:
+                on_error("UpdateService", _error_code(e))
+            print(f"❌ Task definition deployment failed: {_error_code(e)}")
             return False
 
     def _service_exists(self, service_name: str) -> bool:
@@ -422,6 +705,14 @@ class AWSInterface:
                 cluster=self.cluster, services=[service_name]
             )
 
+            failures = response.get("failures", [])
+            if failures and not all(failure.get("reason") == "MISSING" for failure in failures):
+                logger.warning(
+                    "service_check_uncertain",
+                    extra={"service_name": service_name, "failures": failures},
+                )
+                return True
+
             for service in response.get("services", []):
                 status = service.get("status", "")
                 # ACTIVE = running, DRAINING = being deleted
@@ -444,12 +735,20 @@ class AWSInterface:
             return True
 
     def _create_ecs_service(
-        self, service_name: str, pr_number: int, github_user: str, task_def_arn: str
+        self,
+        service_name: str,
+        pr_number: int,
+        github_user: str,
+        task_def_arn: str,
+        *,
+        ecs_client: Optional[Any] = None,
+        on_error: Optional[Callable[[str, str], None]] = None,
     ) -> bool:
         """Create ECS service (replicate exact GHA create-service step)"""
         try:
             # Replicate exact GHA create-service command parameters
-            self.ecs_client.create_service(
+            client = ecs_client or self.ecs_client
+            client.create_service(
                 cluster=self.cluster,
                 serviceName=service_name,  # pr-{pr_number}-service
                 taskDefinition=task_def_arn,  # Use our custom task definition with env vars
@@ -479,7 +778,9 @@ class AWSInterface:
             return True
 
         except Exception as e:
-            print(f"❌ ECS service creation failed: {e}")
+            if on_error is not None:
+                on_error("CreateService", _error_code(e))
+            print(f"❌ ECS service creation failed: {_error_code(e)}")
             return False
 
     def _wait_for_deployment_and_get_ip(
@@ -498,7 +799,7 @@ class AWSInterface:
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
+                WaiterConfig={"Delay": 30, "MaxAttempts": timeout_minutes * 2},
             )
 
             # Get IP after deployment is stable
@@ -507,14 +808,28 @@ class AWSInterface:
         except Exception:
             return None
 
+    def _iter_service_arns(self) -> List[str]:
+        """Return every ECS service ARN, raising instead of hiding partial inventory."""
+        service_arns: List[str] = []
+        next_token: Optional[str] = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {"cluster": self.cluster}
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                response = self.ecs_client.list_services(**kwargs)
+                service_arns.extend(response.get("serviceArns", []))
+                next_token = response.get("nextToken")
+                if not next_token:
+                    return service_arns
+        except Exception as exc:
+            raise AWSError(message=str(exc), operation="list_services") from exc
+
     def list_circus_environments(self) -> List[Dict[str, Any]]:
         """List all environments with circus tags"""
         try:
-            # List all services in cluster
-            services_response = self.ecs_client.list_services(cluster=self.cluster)
-
             circus_services = []
-            for service_arn in services_response["serviceArns"]:
+            for service_arn in self._iter_service_arns():
                 service_name = service_arn.split("/")[-1]
 
                 # Check if it's a circus service (pr-{number}-{sha} pattern)
@@ -524,6 +839,13 @@ class AWSInterface:
                         cluster=self.cluster, services=[service_name]
                     )
 
+                    failures = service_response.get("failures", [])
+                    if failures:
+                        raise AWSError(
+                            message=str(failures),
+                            operation="describe_services",
+                            resource=service_name,
+                        )
                     if service_response["services"]:
                         service = service_response["services"][0]
                         circus_services.append(
@@ -534,13 +856,16 @@ class AWSInterface:
                                 "desired_count": service["desiredCount"],
                                 "created_at": service["createdAt"],
                                 "ip": self.get_environment_ip(service_name),
+                                "task_definition_arn": service.get("taskDefinition"),
                             }
                         )
 
             return circus_services
 
-        except Exception:
-            return []
+        except AWSError:
+            raise
+        except Exception as exc:
+            raise AWSError(message=str(exc), operation="list_circus_environments") from exc
 
     def cleanup_orphaned_environments(self, max_age_hours: int = 48) -> List[str]:
         """Clean up environments older than max_age_hours"""
@@ -565,7 +890,14 @@ class AWSInterface:
                     pr_number = int(service_name.split("-")[1])
 
                     # Delete the service
-                    if self.delete_environment(service_name, pr_number):
+                    base_name = (
+                        service_name[:-8] if service_name.endswith("-service") else service_name
+                    )
+                    delete_kwargs: Dict[str, Any] = {}
+                    task_definition_arn = service.get("task_definition_arn")
+                    if task_definition_arn:
+                        delete_kwargs["expected_task_definition_arn"] = task_definition_arn
+                    if self.delete_environment(base_name, pr_number, **delete_kwargs):
                         orphaned.append(service_name)
 
             return orphaned
@@ -594,9 +926,7 @@ class AWSInterface:
             env_vars = task_def["containerDefinitions"][0].get("environment", [])
 
             return {
-                e["name"]: e["value"]
-                for e in env_vars
-                if e["name"].startswith("SUPERSET_FEATURE_")
+                e["name"]: e["value"] for e in env_vars if e["name"].startswith("SUPERSET_FEATURE_")
             }
         except Exception as e:
             print(f"⚠️ Failed to fetch current feature flags: {e}")
@@ -712,10 +1042,7 @@ class AWSInterface:
             # cutoff_timestamp = time.time() - (hours * 3600)  # Not used in current implementation
             expired_services = []
 
-            # List all services in cluster
-            response = self.ecs_client.list_services(cluster=self.cluster)
-
-            for service_arn in response.get("serviceArns", []):
+            for service_arn in self._iter_service_arns():
                 service_name = service_arn.split("/")[-1]
 
                 # Only check services that match showtime pattern: pr-{number}-service
@@ -758,46 +1085,32 @@ class AWSInterface:
                         )
 
                 except Exception as e:
-                    print(f"⚠️ Could not check service {service_name}: {e}")
-                    continue
+                    raise AWSError(
+                        message=str(e),
+                        operation="list_tags_for_resource",
+                        resource=service_name,
+                    ) from e
 
             return expired_services
 
+        except AWSError:
+            raise
         except Exception as e:
-            print(f"❌ Failed to find expired services: {e}")
-            return []
+            raise AWSError(message=str(e), operation="find_expired_services") from e
 
     def find_showtime_services(self) -> List[str]:
         """Find all ECS services managed by showtime (pr-* pattern)"""
-        try:
-            # List all services in cluster
-            response = self.ecs_client.list_services(cluster=self.cluster)
-
-            if not response.get("serviceArns"):
-                return []
-
-            # Extract service names and filter for showtime pattern
-            showtime_services = []
-            for service_arn in response["serviceArns"]:
-                service_name = service_arn.split("/")[-1]  # Extract name from ARN
-                if service_name.startswith("pr-") and "-service" in service_name:
-                    showtime_services.append(service_name)
-
-            return sorted(showtime_services)
-
-        except Exception as e:
-            print(f"❌ Failed to find showtime services: {e}")
-            return []
+        service_names = [arn.split("/")[-1] for arn in self._iter_service_arns()]
+        return sorted(
+            name for name in service_names if name.startswith("pr-") and "-service" in name
+        )
 
     def _find_pr_services(self, pr_number: int) -> List[Dict[str, Any]]:
         """Find all ECS services for a specific PR"""
         try:
             pr_services = []
 
-            # List all services in cluster
-            response = self.ecs_client.list_services(cluster=self.cluster)
-
-            for service_arn in response.get("serviceArns", []):
+            for service_arn in self._iter_service_arns():
                 service_name = service_arn.split("/")[-1]
 
                 # Check if service matches PR pattern: pr-{number}-{sha}-service
@@ -810,6 +1123,13 @@ class AWSInterface:
                             cluster=self.cluster, services=[service_name]
                         )
 
+                        failures = service_response.get("failures", [])
+                        if failures:
+                            raise AWSError(
+                                message=str(failures),
+                                operation="describe_services",
+                                resource=service_name,
+                            )
                         if service_response["services"]:
                             service = service_response["services"][0]
 
@@ -830,15 +1150,21 @@ class AWSInterface:
                                 }
                             )
 
+                    except AWSError:
+                        raise
                     except Exception as e:
-                        print(f"⚠️ Could not check service {service_name}: {e}")
-                        continue
+                        raise AWSError(
+                            message=str(e),
+                            operation="describe_services",
+                            resource=service_name,
+                        ) from e
 
             return pr_services
 
+        except AWSError:
+            raise
         except Exception as e:
-            print(f"❌ Failed to find PR services: {e}")
-            return []
+            raise AWSError(message=str(e), operation="find_pr_services") from e
 
     def _wait_for_service_stability(self, service_name: str, timeout_minutes: int = 10) -> bool:
         """Wait for ECS service to become stable (replicate GHA wait-for-service-stability)"""
@@ -850,7 +1176,7 @@ class AWSInterface:
             waiter.wait(
                 cluster=self.cluster,
                 services=[service_name],
-                WaiterConfig={"Delay": 30, "maxAttempts": timeout_minutes * 2},
+                WaiterConfig={"Delay": 30, "MaxAttempts": timeout_minutes * 2},
             )
 
             print(f"✅ Service {service_name} is stable")
@@ -861,7 +1187,7 @@ class AWSInterface:
             return False
 
     def _health_check_service(self, service_name: str, max_attempts: int = 6) -> bool:
-        """Health check service by testing HTTP response"""
+        """Compatibility helper that accepts only a strict streaming /health 200."""
         import time
 
         import httpx
@@ -878,24 +1204,21 @@ class AWSInterface:
                     continue
 
                 health_url = f"http://{ip}:8080/health"  # Superset health endpoint
-                fallback_url = f"http://{ip}:8080/"  # Fallback to main page
 
                 try:
-                    with httpx.Client(timeout=10.0) as client:
-                        # Try health endpoint first
+                    with httpx.Client(
+                        timeout=httpx.Timeout(connect=2, read=3, write=1, pool=1),
+                        follow_redirects=False,
+                    ) as client:
                         try:
-                            response = client.get(health_url)
-                            if response.status_code == 200:
-                                print(f"✅ Health check passed on attempt {attempt + 1}")
-                                return True
+                            with client.stream(
+                                "GET", health_url, follow_redirects=False
+                            ) as response:
+                                if response.status_code == 200:
+                                    print(f"✅ Health check passed on attempt {attempt + 1}")
+                                    return True
                         except httpx.RequestError:
                             pass
-
-                        # Fallback to main page
-                        response = client.get(fallback_url)
-                        if response.status_code == 200:
-                            print(f"✅ Health check passed (main page) on attempt {attempt + 1}")
-                            return True
 
                 except Exception as e:
                     print(f"⚠️ Health check attempt {attempt + 1} failed: {e}")

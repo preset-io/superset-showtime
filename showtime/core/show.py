@@ -4,9 +4,29 @@
 Single environment operations: Docker build, AWS deployment, state transitions.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from hashlib import sha256
+from typing import Any, Dict, List, Optional
+
+from .readiness import (
+    DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DiagnosticSummary,
+    configured_secret_values,
+    render_diagnostic_summary,
+)
+from .runner_smoke import (
+    DEFAULT_BUILD_TIMEOUT_SECONDS,
+    DEFAULT_DIAGNOSTICS_DIR,
+    DEFAULT_SMOKE_TIMEOUT_SECONDS,
+    RunnerSmoke,
+    SmokeResult,
+    run_bounded_process,
+)
+from .task_definition import render_task_definition
+
+OUTPUT_METADATA_LIMIT = 64 * 1024
 
 
 # Import interfaces for singleton access
@@ -19,6 +39,11 @@ def get_interfaces():  # type: ignore
     return GitHubInterface(), AWSInterface()
 
 
+def task_definition_fingerprint(task_definition_arn: str) -> str:
+    """Return the compact ownership fingerprint stored in GitHub labels."""
+    return sha256(task_definition_arn.encode()).hexdigest()[:32]
+
+
 @dataclass
 class Show:
     """Single ephemeral environment state from circus labels"""
@@ -29,7 +54,17 @@ class Show:
     ip: Optional[str] = None  # Environment IP address
     created_at: Optional[str] = None  # ISO timestamp
     requested_by: Optional[str] = None  # GitHub username
+    task_definition_arn: Optional[str] = None
+    task_definition_fingerprint: Optional[str] = None
+    service_created: Optional[bool] = False
+    cleanup_pending: bool = False
+    diagnostic: Optional[DiagnosticSummary] = None
     # Note: TTL is now managed at PR-level, not per-Show. See PullRequest.get_pr_ttl_hours()
+
+    def __post_init__(self) -> None:
+        """Derive persistent ownership state from a runtime task definition ARN."""
+        if self.task_definition_arn and not self.task_definition_fingerprint:
+            self.task_definition_fingerprint = task_definition_fingerprint(self.task_definition_arn)
 
     @property
     def aws_service_name(self) -> str:
@@ -128,30 +163,99 @@ class Show:
                 f"{CIRCUS_PREFIX} {self.sha} {MEANING_TO_EMOJI['requested_by']} {self.requested_by}"
             )
 
+        if self.task_definition_fingerprint:
+            labels.append(f"{CIRCUS_PREFIX} {self.sha} 🧬 {self.task_definition_fingerprint}")
+
+        if self.cleanup_pending:
+            labels.append(f"{CIRCUS_PREFIX} {self.sha} 🧹 cleanup-pending")
+
         return labels
 
-    def build_docker(self, dry_run: bool = False) -> None:
+    def build_docker(
+        self,
+        dry_run: bool = False,
+        build_timeout_seconds: int = DEFAULT_BUILD_TIMEOUT_SECONDS,
+    ) -> Optional[str]:
         """Build Docker image for this environment (atomic operation)"""
         if not dry_run:
-            self._build_docker_image()  # Raises on failure
+            return self._build_docker_image(build_timeout_seconds)  # Raises on failure
+        return None
+
+    def run_smoke(
+        self,
+        image_reference: str,
+        feature_flags: Optional[List[Dict[str, str]]] = None,
+        timeout_seconds: int = DEFAULT_SMOKE_TIMEOUT_SECONDS,
+        diagnostics_dir: str = DEFAULT_DIAGNOSTICS_DIR,
+        runner: Optional[RunnerSmoke] = None,
+    ) -> SmokeResult:
+        """Smoke-test the same rendered definition that ECS will register."""
+        task_definition = render_task_definition(image_reference, feature_flags)
+        return (runner or RunnerSmoke()).run(
+            image_reference,
+            task_definition,
+            pr_number=self.pr_number,
+            sha=self.sha,
+            timeout_seconds=timeout_seconds,
+            diagnostics_dir=diagnostics_dir,
+        )
 
     def deploy_aws(
         self,
         dry_run: bool = False,
         feature_flags: Optional[List[Dict[str, str]]] = None,
+        startup_timeout_seconds: int = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        image_reference: Optional[str] = None,
     ) -> None:
         """Deploy to AWS (atomic operation)"""
         github, aws = get_interfaces()
 
         if not dry_run:
-            result = aws.create_environment(
-                pr_number=self.pr_number,
-                sha=self.sha + "0" * (40 - len(self.sha)),  # Convert to full SHA
-                github_user=self.requested_by or "unknown",
-                feature_flags=feature_flags,
+            create_options: Dict[str, Any] = {
+                "pr_number": self.pr_number,
+                "sha": self.sha + "0" * (40 - len(self.sha)),
+                "github_user": self.requested_by or "unknown",
+                "feature_flags": feature_flags,
+                "startup_timeout_seconds": startup_timeout_seconds,
+            }
+            if image_reference is not None:
+                create_options["image_reference"] = image_reference
+            result = aws.create_environment(**create_options)
+
+            result_service_created = getattr(result, "service_created", False)
+            self.service_created = (
+                result_service_created
+                if result_service_created is None or isinstance(result_service_created, bool)
+                else False
+            )
+            # A pre-creation failure cannot retire a previous allocation's ownership.
+            if self.service_created is not False or not self.cleanup_pending:
+                result_task_definition = getattr(result, "task_definition_arn", None)
+                self.task_definition_arn = (
+                    result_task_definition if isinstance(result_task_definition, str) else None
+                )
+                self.task_definition_fingerprint = (
+                    task_definition_fingerprint(self.task_definition_arn)
+                    if self.task_definition_arn
+                    else None
+                )
+                self.cleanup_pending = False
+
+            result_diagnostic = getattr(result, "diagnostic", None)
+            self.diagnostic = (
+                result_diagnostic if isinstance(result_diagnostic, DiagnosticSummary) else None
             )
 
             if not result.success:
+                if self.diagnostic is not None:
+                    try:
+                        print(
+                            render_diagnostic_summary(
+                                self.diagnostic, configured_secret_values(feature_flags)
+                            )
+                        )
+                    except Exception as exc:
+                        print("⚠️ Startup diagnostic rendering failed: " f"{type(exc).__name__}")
                 raise Exception(f"AWS deployment failed: {result.error}")
 
             # Update with deployment results
@@ -160,32 +264,56 @@ class Show:
             # Mock successful deployment for dry-run
             self.ip = "52.1.2.3"
 
-    def stop(self, dry_run_github: bool = False, dry_run_aws: bool = False) -> bool:
+    def stop(
+        self,
+        dry_run_github: bool = False,
+        dry_run_aws: bool = False,
+        *,
+        require_ownership: bool = False,
+        delete_image: bool = True,
+    ) -> bool:
         """Stop this environment (cleanup AWS resources)
 
         Returns:
             True if successful, False otherwise
         """
-        github, aws = get_interfaces()
+        if dry_run_aws:
+            return True
 
         # Delete AWS resources (pure technical work)
-        if not dry_run_aws:
+        _, aws = get_interfaces()
+        expected_arn = self.task_definition_arn if require_ownership else None
+        expected_fingerprint = (
+            self.task_definition_fingerprint if require_ownership or self.cleanup_pending else None
+        )
+        if require_ownership or self.cleanup_pending:
+            result = aws.delete_environment(
+                self.aws_service_name,
+                self.pr_number,
+                expected_task_definition_arn=expected_arn,
+                expected_task_definition_fingerprint=expected_fingerprint or "",
+                delete_image=delete_image,
+            )
+        else:
             result = aws.delete_environment(self.aws_service_name, self.pr_number)
-            return bool(result)
+        return bool(result)
 
-        return True  # Dry run is always "successful"
-
-    def _build_docker_image(self) -> None:
+    def _build_docker_image(self, timeout_seconds: int) -> str:
         """Build Docker image for this environment"""
+        import json
         import os
-        import subprocess
+        import tempfile
 
         tag = f"apache/superset:pr-{self.pr_number}-{self.sha}-ci"
 
         # Detect if running in CI environment
         is_ci = bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
 
-        # Build command without final path
+        descriptor, metadata_path = tempfile.mkstemp(
+            prefix="showtime-build-metadata-", suffix=".json"
+        )
+        os.close(descriptor)
+        os.chmod(metadata_path, 0o600)
         cmd = [
             "docker",
             "buildx",
@@ -201,6 +329,8 @@ class Show:
             "LOAD_EXAMPLES_DUCKDB=true",
             "-t",
             tag,
+            "--metadata-file",
+            metadata_path,
         ]
 
         # Add caching based on environment
@@ -240,23 +370,33 @@ class Show:
         print(f"🐳 Building Docker image: {tag}")
         print(f"🐳 Command: {' '.join(cmd)}")
 
-        # Stream output in real-time
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-
-        if process.stdout:
-            for line in process.stdout:
-                print(f"🐳 {line.rstrip()}")
-
-        return_code = process.wait(timeout=3600)
-        if return_code != 0:
-            raise Exception(f"Docker build failed with exit code: {return_code}")
+        try:
+            process = run_bounded_process(
+                cmd,
+                timeout_seconds,
+                secret_values=configured_secret_values(),
+                stream_prefix="🐳 ",
+            )
+            if not process.success:
+                if process.interrupted:
+                    raise RuntimeError("Docker build interrupted")
+                if process.timed_out:
+                    raise RuntimeError("Docker build timed out")
+                raise RuntimeError(f"Docker build failed with exit code: {process.returncode}")
+            with open(metadata_path) as metadata_file:
+                encoded = metadata_file.read(OUTPUT_METADATA_LIMIT + 1)
+            if len(encoded) > OUTPUT_METADATA_LIMIT:
+                raise RuntimeError("Docker build metadata exceeds the configured limit")
+            metadata: Dict[str, Any] = json.loads(encoded)
+            digest = metadata.get("containerimage.digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise RuntimeError("Docker build did not return a valid manifest digest")
+            return f"apache/superset@{digest}"
+        finally:
+            try:
+                os.unlink(metadata_path)
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def from_circus_labels(cls, pr_number: int, labels: List[str], sha: str) -> Optional["Show"]:
@@ -289,6 +429,10 @@ class Show:
                 # Note: TTL (⌛) labels are now PR-level, not per-SHA. Ignored here.
                 elif emoji == "🤡":  # User (clown!)
                     show_data["requested_by"] = value
+                elif emoji == "🧬":  # Task definition ownership fingerprint
+                    show_data["task_definition_fingerprint"] = value
+                elif emoji == "🧹" and value == "cleanup-pending":
+                    show_data["cleanup_pending"] = True
 
         # Return Show if we found any status labels for this SHA
         # For list purposes, we want to show ALL environments, even orphaned ones

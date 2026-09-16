@@ -502,7 +502,7 @@ def test_pullrequest_sync_create_environment(mock_get_github: Mock) -> None:
                         # Verify state transitions
                         mock_show.build_docker.assert_called_once_with(True)
                         mock_show.deploy_aws.assert_called_once_with(
-                            True, feature_flags=[]
+                            True, feature_flags=[], startup_timeout_seconds=1800
                         )
                         assert mock_show.status == "running"
 
@@ -624,7 +624,7 @@ def test_pullrequest_sync_destroy_environment_failure_skips_cleanup_comment(
             with patch.object(pr, "_post_cleanup_comment") as mock_cleanup:
                 result = pr.sync("abc123f", dry_run_github=True, dry_run_aws=True)
 
-                assert result.success is True
+                assert result.success is False
                 assert result.action_taken == "destroy_environment"
                 mock_cleanup.assert_not_called()
 
@@ -683,12 +683,10 @@ def test_pullrequest_sync_rolling_update_failure_posts_rolling_failure_comment(
     with patch.object(pr, "_determine_action", return_value="rolling_update"):
         with patch.object(pr, "_atomic_claim", return_value=True):
             with patch.object(pr, "_create_new_show") as mock_create:
-                with patch.object(pr, "_post_rolling_start_comment"):
+                with patch.object(pr, "_post_building_comment"):
                     with patch.object(pr, "_update_show_labels"):
                         with patch.object(pr, "_post_showtime_comment") as mock_post:
-                            mock_new_show = Show(
-                                pr_number=1234, sha="def456a", status="building"
-                            )
+                            mock_new_show = Show(pr_number=1234, sha="def456a", status="building")
                             mock_create.return_value = mock_new_show
                             mock_new_show.build_docker = Mock(  # type: ignore[method-assign]
                                 side_effect=Exception("rolling deploy failed")
@@ -765,12 +763,12 @@ def test_pullrequest_sync_rolling_update_success_comment_failure_not_treated_as_
     with patch.object(pr, "_determine_action", return_value="rolling_update"):
         with patch.object(pr, "_atomic_claim", return_value=True):
             with patch.object(pr, "_create_new_show") as mock_create:
-                with patch.object(pr, "_post_rolling_start_comment"):
+                with patch.object(pr, "_post_building_comment"):
                     with patch.object(pr, "_update_show_labels"):
                         with patch.object(pr, "_post_showtime_comment") as mock_post:
                             with patch.object(
                                 pr,
-                                "_post_rolling_success_comment",
+                                "_post_success_comment",
                                 side_effect=Exception("comment post failed"),
                             ):
                                 mock_new_show = Show(
@@ -840,9 +838,9 @@ def test_pullrequest_atomic_claim_success(mock_get_github: Mock) -> None:
                     assert result is True
                     # Verify trigger labels removed
                     mock_remove_label.assert_called_with("🎪 ⚡ showtime-trigger-start")
-                    # Verify SHA labels removed (without deleting definitions to
-                    # avoid wasteful re-creation in _update_show_labels)
-                    mock_remove_sha.assert_called_with("abc123f", delete_definitions=False)
+                    # Add-first reconciliation must not erase the old status
+                    # before replacement attachment succeeds.
+                    mock_remove_sha.assert_not_called()
 
 
 @patch("showtime.core.pull_request.get_github")

@@ -17,7 +17,7 @@ Superset Showtime is a CLI tool designed primarily for **GitHub Actions** to man
 3. Watch the magic happen - labels will update automatically
 4. When you see `🎪 🚦 {sha} running`, your environment is ready!
 5. Get URL from `🎪 🌐 {sha} {ip}` → `http://{ip}:8080`
-6. **Every new commit automatically deploys a fresh environment** (zero-downtime)
+6. **Every new commit can deploy a fresh environment** while the prior SHA remains available until promotion succeeds
 
 **To test a specific commit without auto-updates:**
 - Add label: `🎪 🧊 showtime-freeze` (prevents auto-sync on new commits)
@@ -26,7 +26,7 @@ Superset Showtime is a CLI tool designed primarily for **GitHub Actions** to man
 ```bash
 # Add this label:
 🎪 🛑 showtime-trigger-stop
-# All circus labels disappear, AWS resources cleaned up
+# Labels disappear only after AWS deletion is confirmed
 ```
 
 ## 🎪 How It Works
@@ -62,8 +62,12 @@ flowchart TD
 
     D --> H[📋 State: building]
     E --> H
-    H --> I[🐳 Docker build]
-    I -->|Success| J[📋 State: built]
+    H --> I[🐳 Docker build + immutable digest]
+    I -->|Success| S{Runner smoke enabled?}
+    S -->|Yes| T[Local /health smoke + owned cleanup]
+    S -->|No| J[📋 State: built]
+    T -->|Healthy and cleaned| J
+    T -->|Failure| K
     I -->|Fail| K[📋 State: failed]
 
     J --> L[📋 State: deploying]
@@ -93,11 +97,12 @@ showtime labels                 # Complete label reference
 **Testing/development:**
 ```bash
 showtime sync 1234 --dry-run-aws --dry-run-docker  # Test without costs
+showtime sync 1234 --dry-run-github                 # Read GitHub state without writes
 showtime cleanup --dry-run --older-than 1h         # Test environment + label cleanup
 showtime cleanup-labels                         # Preview stale repo label definitions
 ```
 
-> **Architecture**: This CLI implements ACID-style atomic transactions with direct Docker integration. It handles complete environment lifecycle from Docker build to AWS deployment with race condition prevention.
+> **Architecture**: GitHub label writes and AWS operations are not transactional. Showtime preserves the previous environment during a different-SHA deployment and records partial cleanup so serialized retries can converge safely. Callers must serialize operations for each PR; there is no distributed global lock.
 
 ## 🎪 Complete Label Reference
 
@@ -106,7 +111,7 @@ showtime cleanup-labels                         # Preview stale repo label defin
 | Label | Action | Result |
 |-------|---------|---------|
 | `🎪 ⚡ showtime-trigger-start` | Create environment | Builds and deploys ephemeral environment with blue-green deployment |
-| `🎪 🛑 showtime-trigger-stop` | Destroy environment | Cleans up AWS resources and removes all labels |
+| `🎪 🛑 showtime-trigger-stop` | Destroy environment | Removes resource labels only after confirmed AWS deletion |
 | `🎪 🧊 showtime-freeze` | Freeze environment | Prevents auto-sync on new commits (for testing specific SHAs) |
 
 ### 📊 State Labels (Automatically Managed)
@@ -120,6 +125,8 @@ showtime cleanup-labels                         # Preview stale repo label defin
 | `🎪 {sha} 🌐 {ip:port}` | Environment URL | `🎪 abc123f 🌐 52.1.2.3:8080` |
 | `🎪 {sha} ⌛ {ttl}` | Time-to-live policy | `🎪 abc123f ⌛ 24h` |
 | `🎪 {sha} 🤡 {username}` | Who requested | `🎪 abc123f 🤡 maxime` |
+| `🎪 {sha} 🧬 {fingerprint}` | Task-definition ownership used for guarded cleanup | `🎪 abc123f 🧬 0123456789abcdef0123456789abcdef` |
+| `🎪 {sha} 🧹 cleanup-pending` | AWS deletion is unconfirmed and tracking must remain | `🎪 abc123f 🧹 cleanup-pending` |
 
 ## 🔧 Testing Configuration Changes
 
@@ -177,8 +184,130 @@ You'll see:
 🎪 def456a 🚦 running       # New environment live
 🎪 🎯 def456a               # Traffic switched
 🎪 def456a 🌐 52-4-5-6      # New IP address
-# All abc123f labels removed automatically
+# abc123f labels are removed after its AWS deletion is confirmed
 ```
+
+The cross-SHA flow promotes the candidate only after deployment succeeds. A failed
+candidate does not move the active pointer or delete the prior healthy service.
+Cleanup removes labels only after service absence is confirmed; false returns,
+exceptions, ownership mismatches, and uncertain AWS responses retain tracking and
+make the CLI exit nonzero.
+
+An explicit rebuild of the same SHA is different: service names are deterministic,
+so it destructively reuses that service identity and has no fallback environment.
+Showtime warns before this path. Per-PR operations must remain serialized. GitHub
+label writes can still be partially applied, and a later sync reconciles the active
+pointer without rebuilding a candidate that is already marked running.
+
+Per-PR teardown only detaches labels. Repository-wide label definitions may be
+shared by other PRs and are deleted exclusively by `cleanup-labels` after a global
+attachment-count check.
+
+## Startup readiness and diagnostics
+
+`start` and `sync` accept `--startup-timeout-seconds`, or
+`SHOWTIME_STARTUP_TIMEOUT_SECONDS`. The default is 1800 seconds (30 minutes);
+values must be positive integers and are validated before deployment changes.
+
+```bash
+showtime sync PR_NUMBER --sha SHA --startup-timeout-seconds 1800
+```
+
+After task-definition registration and any required same-SHA teardown, one
+monotonic startup budget covers dedicated client setup, service creation, update,
+task observation, networking, and HTTP health checks. Task
+replacement does not reset it. Success requires the expected task definition,
+one stable primary deployment with matching running/desired counts and no
+pending tasks, and `/health` returning HTTP 200 from that deployment's running
+task. An incomplete or failed rollout cannot pass just because HTTP responds;
+there is no homepage or redirect fallback.
+
+Showtime reports task, endpoint, and service-state changes while waiting. A
+stopped task can be replaced within the original budget. Failed rollouts and
+terminal service states fail promptly. Newly created service/task/network
+identities get a bounded visibility allowance of up to five minutes, constrained
+by the original deadline; permission errors are not treated as visibility delays.
+Historical task records cannot establish current readiness, and historical scans
+do not delay a candidate that has already passed strict health. After a failed
+probe, historical collection has a 15-second per-cycle cap and reserves time for
+the next live poll; incomplete history is reported as partial evidence.
+
+Startup AWS requests use 2-second connect and 5-second read timeouts with SDK
+retries disabled. HTTP uses a streaming response and finite timeouts without
+reading the body. A request is not started with less than its 7-second transport
+allowance remaining. These are practical request bounds, not an unconditional
+process kill: DNS, credential providers, and OS scheduling can affect elapsed
+time. The longer default is a mitigation, not a diagnosis of slow application
+startup.
+
+Before failed-candidate cleanup, Showtime collects bounded service/task evidence,
+including exit codes, stop reasons, replacements, and recent service events.
+An additional 30-second diagnostic budget permits at most one CloudWatch log
+page (100 events), with log content limited to 100 lines and 16 KiB. Log access
+uses the packaged ECS log configuration and requires optional `logs:GetLogEvents`
+permission on that log group. Available, empty, denied, unavailable, and
+not-attempted logs are reported distinctly. Known configured secret values are
+redacted; raw task environments and AWS exception payloads are not printed.
+Diagnostic failures cannot suppress candidate cleanup or erase the primary
+failure. Total command time can exceed the startup budget by this diagnostic
+allowance and the existing bounded cleanup waits.
+
+## Optional runner smoke test
+
+`start` and `sync` expose a local pre-deployment smoke test. It is off by
+default and can be enabled with `--smoke-test` or `SHOWTIME_SMOKE_TEST=true`.
+The managed path builds and pushes `linux/amd64`, reads Buildx's manifest
+digest, then uses that exact `apache/superset@sha256:...` reference for both
+the smoke container and ECS task definition. Missing or malformed digest
+metadata stops before smoke or AWS.
+
+```bash
+showtime sync PR_NUMBER --smoke-test \
+  --build-timeout-seconds 3600 \
+  --smoke-timeout-seconds 600 \
+  --smoke-diagnostics-dir .showtime/diagnostics
+```
+
+Environment equivalents are `SHOWTIME_BUILD_TIMEOUT_SECONDS`,
+`SHOWTIME_SMOKE_TIMEOUT_SECONDS`, and `SHOWTIME_SMOKE_DIAGNOSTICS_DIR`.
+Timeouts must be positive integers. The diagnostics path must be writable and
+must not use symlinked directories. The reference Actions job allows 120 minutes;
+adjust its job timeout when changing the build, smoke, ECS, or cleanup budgets.
+
+The disposable container is rendered from the packaged ECS task definition,
+including effective feature flags, entrypoint, command, container port, 0.5
+CPU, and 2 GiB memory with swap capped at the same value. Its port is published
+only on `127.0.0.1` with an ephemeral host port. Environment values are written
+to a mode-0600 temporary env file, never command arguments, and the file is
+deleted immediately after create. Success requires `/health` HTTP 200 and
+verified removal of the randomly named, ownership-labelled container before
+any AWS allocation. ECS readiness remains mandatory afterward.
+
+Build output, Docker errors, and retained logs use the same redaction rules
+and finite buffers. On smoke failure Showtime writes unique mode-0600
+`runner-smoke-pr-<pr>-<sha>-<attempt>.json` and `.log` files. JSON contains only
+the primary outcome, selected container state, mapped port, immutable image,
+log status, cleanup result, and secondary evidence errors. Log status is one
+of `captured_nonempty`, `captured_empty`, `unavailable`, or `not_attempted`;
+logs are limited to 100 lines and 16 KiB. Process output retention is limited
+to 64 KiB. Docker commands have 30-second execution budgets, HTTP requests have seven-second
+request envelopes, and diagnostic and cleanup work have separate 30-second budgets.
+Subprocess shutdown can add up to seven seconds for TERM/KILL handling. Handled SIGINT
+and SIGTERM trigger bounded evidence and owned cleanup; SIGKILL cannot be
+cleaned up by the process.
+
+Showtime creates local diagnostic files but does not upload them. Every
+consuming workflow must add an `if: always()` `actions/upload-artifact@v4`
+step with `include-hidden-files: true` and the narrow path
+`.showtime/diagnostics/runner-smoke-*`; do not upload `.showtime/` wholesale.
+See `workflows-reference/showtime-trigger.yml` for the default-off example.
+
+The smoke check approximates packaged startup and resource limits. It does not
+reproduce Fargate networking, scheduling, or logging, does not establish the
+unknown incident cause, and never replaces strict ECS readiness. Fully mocked
+testing remains available with both `--dry-run-docker --dry-run-aws`; skipping
+Docker is rejected with live AWS or with smoke enabled because neither can
+prove immutable identity.
 
 ## 🔒 Security & Permissions
 
@@ -200,7 +329,7 @@ You'll see:
 
 **Commands used:**
 ```bash
-showtime sync PR_NUMBER --check-only    # Determine build_needed + target_sha
+showtime sync PR_NUMBER --check-only    # Read-only: determine build_needed + target_sha
 showtime sync PR_NUMBER --sha SHA       # Execute atomic claim + build + deploy
 ```
 

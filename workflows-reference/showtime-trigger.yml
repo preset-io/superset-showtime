@@ -29,12 +29,15 @@ env:
   GITHUB_ACTOR: ${{ github.actor }}
   DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
   DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  # Opt in only after raising timeout-minutes to cover build + smoke + ECS readiness (>100m).
+  SHOWTIME_SMOKE_TEST: "false"
+  SHOWTIME_SMOKE_TIMEOUT_SECONDS: "600"
 
 jobs:
   sync:
     name: 🎪 Sync PR to desired state
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     permissions:
       contents: read
@@ -171,3 +174,12 @@ jobs:
           else
             python -m showtime sync $PR_NUM
           fi
+
+      - name: Upload Showtime runner-smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showtime-runner-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .showtime/diagnostics/runner-smoke-*
+          if-no-files-found: ignore
+          include-hidden-files: true

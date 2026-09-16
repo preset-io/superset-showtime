@@ -88,16 +88,53 @@ class TestCreateEnvironmentStubberFlow:
             },
         )
 
-    def _stub_list_tasks(self, stubber: Stubber, service_name: str) -> None:
-        """Stub list_tasks response"""
+    def _stub_readiness_service(self, stubber: Stubber, service_name: str) -> None:
+        """Stub the exact stable candidate service identity."""
+        task_definition = "arn:aws:ecs:us-west-2:123456789:task-definition/superset-ci:100"
+        stubber.add_response(
+            "describe_services",
+            {
+                "services": [
+                    {
+                        "serviceName": service_name,
+                        "status": "ACTIVE",
+                        "taskDefinition": task_definition,
+                        "desiredCount": 1,
+                        "runningCount": 1,
+                        "pendingCount": 0,
+                        "deployments": [
+                            {
+                                "status": "PRIMARY",
+                                "taskDefinition": task_definition,
+                                "desiredCount": 1,
+                                "runningCount": 1,
+                                "pendingCount": 0,
+                                "rolloutState": "COMPLETED",
+                            }
+                        ],
+                        "events": [],
+                    }
+                ],
+                "failures": [],
+            },
+            expected_params={"cluster": "superset-ci", "services": [service_name]},
+        )
+
+    def _stub_list_tasks(
+        self, stubber: Stubber, service_name: str, desired_status: str = "RUNNING"
+    ) -> None:
+        """Stub one desired-status task inventory."""
+        task_arns = []
+        if desired_status == "RUNNING":
+            task_arns = ["arn:aws:ecs:us-west-2:123456789:task/superset-ci/task-123"]
         stubber.add_response(
             "list_tasks",
-            {
-                "taskArns": [
-                    f"arn:aws:ecs:us-west-2:123456789:task/superset-ci/task-{service_name}"
-                ]
+            {"taskArns": task_arns},
+            expected_params={
+                "cluster": "superset-ci",
+                "serviceName": service_name,
+                "desiredStatus": desired_status,
             },
-            expected_params={"cluster": "superset-ci", "serviceName": service_name},
         )
 
     def _stub_describe_tasks(self, stubber: Stubber) -> None:
@@ -108,7 +145,9 @@ class TestCreateEnvironmentStubberFlow:
                 "tasks": [
                     {
                         "taskArn": "arn:aws:ecs:us-west-2:123456789:task/superset-ci/task-123",
+                        "taskDefinitionArn": "arn:aws:ecs:us-west-2:123456789:task-definition/superset-ci:100",
                         "lastStatus": "RUNNING",
+                        "desiredStatus": "RUNNING",
                         "attachments": [
                             {
                                 "type": "ElasticNetworkInterface",
@@ -120,7 +159,10 @@ class TestCreateEnvironmentStubberFlow:
                     }
                 ]
             },
-            expected_params={"cluster": "superset-ci", "tasks": ANY},
+            expected_params={
+                "cluster": "superset-ci",
+                "tasks": ["arn:aws:ecs:us-west-2:123456789:task/superset-ci/task-123"],
+            },
         )
 
     def _stub_describe_network_interfaces(self, ec2_stubber: Stubber) -> None:
@@ -152,35 +194,20 @@ class TestCreateEnvironmentStubberFlow:
         self._stub_create_service(ecs_stubber, service_name)
         self._stub_update_service(ecs_stubber, service_name)
 
-        # get_environment_ip is called twice:
-        # 1. By _health_check_service to get IP for HTTP health check
-        # 2. By create_environment to return IP in result
-        # We need to stub both calls
-        self._stub_list_tasks(ecs_stubber, service_name)
-        self._stub_describe_tasks(ecs_stubber)
-        self._stub_describe_network_interfaces(ec2_stubber)
-        # Second call for final IP retrieval
+        self._stub_readiness_service(ecs_stubber, service_name)
         self._stub_list_tasks(ecs_stubber, service_name)
         self._stub_describe_tasks(ecs_stubber)
         self._stub_describe_network_interfaces(ec2_stubber)
 
         with ecs_stubber, ec2_stubber, stubbers["ecr"]:
-            # Mock the ECS waiter to avoid complex stubbing
-            mock_waiter = Mock()
-            aws.ecs_client.get_waiter = Mock(return_value=mock_waiter)
-
-            # Patch time.sleep to make test fast
-            with patch("time.sleep"):
-                # Patch health check (httpx) since we're not stubbing HTTP
-                with patch("httpx.Client") as mock_httpx:
-                    mock_response = Mock(status_code=200)
-                    mock_httpx.return_value.__enter__.return_value.get.return_value = mock_response
-
-                    result = aws.create_environment(
-                        pr_number=1234,
-                        sha="abc123f",
-                        github_user="testuser",
-                    )
+            with patch("httpx.Client") as mock_httpx:
+                mock_response = Mock(status_code=200)
+                mock_httpx.return_value.stream.return_value.__enter__.return_value = mock_response
+                result = aws.create_environment(
+                    pr_number=1234,
+                    sha="abc123f",
+                    github_user="testuser",
+                )
 
         # Verify success
         assert result.success is True, f"Expected success but got error: {result.error}"
@@ -239,28 +266,20 @@ class TestCreateEnvironmentStubberFlow:
         # Now create succeeds
         self._stub_create_service(ecs_stubber, service_name)
         self._stub_update_service(ecs_stubber, service_name)
-        # get_environment_ip is called twice (health check + final result)
-        self._stub_list_tasks(ecs_stubber, service_name)
-        self._stub_describe_tasks(ecs_stubber)
-        self._stub_describe_network_interfaces(ec2_stubber)
+        self._stub_readiness_service(ecs_stubber, service_name)
         self._stub_list_tasks(ecs_stubber, service_name)
         self._stub_describe_tasks(ecs_stubber)
         self._stub_describe_network_interfaces(ec2_stubber)
 
         with ecs_stubber, ec2_stubber, stubbers["ecr"]:
-            mock_waiter = Mock()
-            aws.ecs_client.get_waiter = Mock(return_value=mock_waiter)
-
-            with patch("time.sleep"):
-                with patch("httpx.Client") as mock_httpx:
-                    mock_response = Mock(status_code=200)
-                    mock_httpx.return_value.__enter__.return_value.get.return_value = mock_response
-
-                    result = aws.create_environment(
-                        pr_number=1234,
-                        sha="abc123f",
-                        github_user="testuser",
-                    )
+            with patch("httpx.Client") as mock_httpx:
+                mock_response = Mock(status_code=200)
+                mock_httpx.return_value.stream.return_value.__enter__.return_value = mock_response
+                result = aws.create_environment(
+                    pr_number=1234,
+                    sha="abc123f",
+                    github_user="testuser",
+                )
 
         assert result.success is True, f"Expected success but got error: {result.error}"
         ecs_stubber.assert_no_pending_responses()
