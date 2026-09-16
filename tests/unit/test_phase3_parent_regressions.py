@@ -234,9 +234,19 @@ def test_real_build_smoke_ecs_chain_uses_one_digest_and_keeps_both_gates(
         assert not remote_health.urls
 
 
-def test_term_grace_waits_for_child_even_after_stdout_closes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", [0, 0.6])
+def test_term_grace_waits_for_child_even_after_stdout_closes(
+    tmp_path: Path, startup_delay: float
+) -> None:
     """Closing output during graceful shutdown must not cause immediate SIGKILL."""
     marker = tmp_path / "graceful-exit"
+    ready = tmp_path / "ready"
+    startup_deadline = time.monotonic() + 10
+
+    def timeout_after_ready() -> float:
+        """Expire after handler installation, with a real startup watchdog."""
+        return 2.0 if ready.exists() or time.monotonic() >= startup_deadline else 0.0
+
     script = """import os, signal, sys, time
 from pathlib import Path
 def stop(signum, frame):
@@ -245,12 +255,16 @@ def stop(signum, frame):
     time.sleep(0.15)
     Path(sys.argv[1]).write_text('graceful')
     sys.exit(0)
+time.sleep(float(sys.argv[3]))
 signal.signal(signal.SIGTERM, stop)
-print('ready', flush=True)
-time.sleep(10)
+Path(sys.argv[2]).write_text("ready")
+time.sleep(30)
 """
     result = run_bounded_process(
-        [sys.executable, "-c", script, str(marker)], 0.3, termination_grace_seconds=0.5
+        [sys.executable, "-c", script, str(marker), str(ready), str(startup_delay)],
+        0.3,
+        monotonic=timeout_after_ready,
+        termination_grace_seconds=5,
     )
     assert result.timed_out
     assert result.returncode == 0
