@@ -862,9 +862,8 @@ class PullRequest:
 
             try:
                 if previous_running:
-                    full_sha = candidate.sha + "0" * (40 - len(candidate.sha))
                     self._post_showtime_comment(
-                        rolling_failure_comment(previous_running[0], full_sha, str(exc)),
+                        rolling_failure_comment(previous_running[0], candidate.sha, str(exc)),
                         dry_run_github,
                     )
                 else:
@@ -1226,26 +1225,6 @@ class PullRequest:
 
         effective_ttl = self._get_effective_ttl_display()
         self._post_showtime_comment(success_comment(show, ttl=effective_ttl), dry_run)
-
-    def _post_rolling_start_comment(
-        self, old_show: Show, new_show: Show, dry_run: bool = False
-    ) -> None:
-        """Post rolling update start comment"""
-        from .github_messages import rolling_start_comment
-
-        full_sha = new_show.sha + "0" * (40 - len(new_show.sha))
-        self._post_showtime_comment(rolling_start_comment(old_show, full_sha), dry_run)
-
-    def _post_rolling_success_comment(
-        self, old_show: Show, new_show: Show, dry_run: bool = False
-    ) -> None:
-        """Post rolling update success comment"""
-        from .github_messages import rolling_success_comment
-
-        effective_ttl = self._get_effective_ttl_display()
-        self._post_showtime_comment(
-            rolling_success_comment(old_show, new_show, ttl=effective_ttl), dry_run
-        )
 
     def _post_cleanup_comment(self, show: Show, dry_run: bool = False) -> None:
         """Post cleanup completion comment"""

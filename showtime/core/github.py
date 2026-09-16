@@ -342,6 +342,12 @@ class GitHubInterface:
         delete — every candidate must also be authored by this token's own
         login before it's removed.
 
+        Comment ids increase monotonically, so a comment id greater than
+        `except_id` was posted after this job's own comment - e.g. by an
+        overlapping sync for a different SHA. Never delete those: it caps
+        the blast radius of overlapping syncs to "an older job's stale
+        comment sticks around" rather than "a newer job's comment vanishes".
+
         Args:
             pr_number: PR to clean up
             except_id: Comment id to preserve, e.g. one just posted
@@ -353,6 +359,8 @@ class GitHubInterface:
         deleted = 0
         for comment in self.get_comments(pr_number):
             if comment["id"] == except_id:
+                continue
+            if except_id is not None and comment["id"] > except_id:
                 continue
             if (comment.get("user") or {}).get("login") != me:
                 continue

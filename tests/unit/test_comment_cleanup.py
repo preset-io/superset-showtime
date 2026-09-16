@@ -318,6 +318,28 @@ class TestDeleteShowtimeComments:
 
         assert deleted == 1
 
+    def test_does_not_delete_comments_posted_after_except_id(self, github: GitHubInterface) -> None:
+        """Two overlapping syncs for different SHAs can each call this with
+        their own posted comment's id. An older job's sweep must not delete a
+        comment a newer job posted after it - comment ids increase
+        monotonically, so a candidate id greater than except_id was posted
+        later and must be left alone."""
+        comments = [
+            self._bot_comment(1, f"🎪 old\n\n{SHOWTIME_COMMENT_MARKER}"),
+            self._bot_comment(2, f"🎪 just posted by this job\n\n{SHOWTIME_COMMENT_MARKER}"),
+            self._bot_comment(
+                3, f"🎪 posted by a newer overlapping job\n\n{SHOWTIME_COMMENT_MARKER}"
+            ),
+        ]
+
+        with patch.object(github, "get_authenticated_login", return_value="showtime-bot"):
+            with patch.object(github, "get_comments", return_value=comments):
+                with patch.object(github, "delete_comment", return_value=True) as mock_delete:
+                    deleted = github.delete_showtime_comments(1234, except_id=2)
+
+        assert deleted == 1
+        assert [call.args[0] for call in mock_delete.call_args_list] == [1]
+
     def test_already_gone_comment_not_counted(self, github: GitHubInterface) -> None:
         """delete_comment returning False (404, already gone) must not inflate
         the reported deleted count"""

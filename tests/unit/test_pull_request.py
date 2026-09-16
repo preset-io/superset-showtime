@@ -702,7 +702,13 @@ def test_pullrequest_sync_rolling_update_failure_posts_rolling_failure_comment(
                             assert result.success is False
                             assert mock_new_show.status == "failed"
                             mock_post.assert_called_once()
-                            assert "rolling deploy failed" in mock_post.call_args.args[0]
+                            posted_body = mock_post.call_args.args[0]
+                            assert "rolling deploy failed" in posted_body
+                            # Regression: the commit link must use the show's actual
+                            # (short) SHA, not that SHA zero-padded into a fake full
+                            # SHA that 404s - candidate.sha is never a full 40-char SHA.
+                            assert "commit/def456a)" in posted_body
+                            assert "def456a0000000000000000000000000000000" not in posted_body
 
 
 @patch("showtime.core.pull_request.get_github")
