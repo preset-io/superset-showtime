@@ -13,6 +13,8 @@ to complete before attempting to create a new service.
 from typing import Any, List
 from unittest.mock import MagicMock, patch
 
+from showtime.core.readiness import ReadinessResult
+
 
 class TestECSServiceDeletionRaceCondition:
     """Test that service deletion waits for completion before creating new service"""
@@ -36,6 +38,9 @@ class TestECSServiceDeletionRaceCondition:
             aws.ecs_client = mock_ecs
             aws.ecr_client = mock_ecr
             aws.ec2_client = mock_ec2
+            readiness = MagicMock()
+            readiness.wait.return_value = ReadinessResult(True, ip="1.2.3.4")
+            aws._readiness_observer_factory = MagicMock(return_value=readiness)
 
             return aws
 
@@ -127,7 +132,9 @@ class TestECSServiceDeletionRaceCondition:
                 with patch.object(aws, "_wait_for_service_deletion", side_effect=track_wait):
                     with patch.object(aws, "_create_ecs_service", return_value=True):
                         with patch.object(aws, "_deploy_task_definition", return_value=True):
-                            with patch.object(aws, "_wait_for_service_stability", return_value=True):
+                            with patch.object(
+                                aws, "_wait_for_service_stability", return_value=True
+                            ):
                                 with patch.object(aws, "_health_check_service", return_value=True):
                                     with patch.object(
                                         aws, "get_environment_ip", return_value="1.2.3.4"
@@ -169,9 +176,13 @@ class TestECSServiceDeletionRaceCondition:
                     aws, "_create_task_definition_with_image_and_flags", return_value="arn:task-def"
                 ):
                     with patch.object(aws, "_delete_ecs_service", side_effect=track_delete):
-                        with patch.object(aws, "_wait_for_service_deletion", side_effect=track_wait):
+                        with patch.object(
+                            aws, "_wait_for_service_deletion", side_effect=track_wait
+                        ):
                             with patch.object(aws, "_create_ecs_service", side_effect=track_create):
-                                with patch.object(aws, "_deploy_task_definition", return_value=True):
+                                with patch.object(
+                                    aws, "_deploy_task_definition", return_value=True
+                                ):
                                     with patch.object(
                                         aws, "_wait_for_service_stability", return_value=True
                                     ):
@@ -357,7 +368,9 @@ class TestECSServiceDeletionRaceCondition:
             result = aws._wait_for_service_deletion(service_name, timeout_minutes=1)
 
         # Should have waited through DRAINING iterations
-        assert call_count >= 4, f"Should have checked at least 4 times, but only checked {call_count}"
+        assert (
+            call_count >= 4
+        ), f"Should have checked at least 4 times, but only checked {call_count}"
         assert result is True, "Should return True after service is fully deleted"
 
     def test_wait_for_service_deletion_fails_if_draining_persists(self) -> None:
@@ -386,7 +399,9 @@ class TestECSServiceDeletionRaceCondition:
         # Should timeout and return False
         assert result is False, "Should return False when service stays DRAINING past timeout"
         # Should have made multiple attempts
-        assert aws.ecs_client.describe_services.call_count >= 10, "Should have retried multiple times"
+        assert (
+            aws.ecs_client.describe_services.call_count >= 10
+        ), "Should have retried multiple times"
 
     def test_create_environment_fails_when_deletion_wait_times_out(self) -> None:
         """
@@ -423,9 +438,9 @@ class TestECSServiceDeletionRaceCondition:
         # Should return error, NOT proceed to create
         assert result.success is False, "Should fail when deletion wait times out"
         assert result.error is not None, "Should have an error message"
-        assert "timeout" in result.error.lower() or "deleted" in result.error.lower(), (
-            f"Error should mention timeout or deletion issue: {result.error}"
-        )
+        assert (
+            "timeout" in result.error.lower() or "deleted" in result.error.lower()
+        ), f"Error should mention timeout or deletion issue: {result.error}"
         assert not create_called, (
             "Should NOT call _create_ecs_service when deletion wait times out - "
             "this would cause 'Creation of service was not idempotent' error"
