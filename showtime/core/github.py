@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
-from .constants import SHOWTIME_COMMENT_MARKER
+from .constants import LEGACY_COMMENT_PREFIX, SHOWTIME_COMMENT_MARKER
 
 # SHA-containing circus label pattern: 🎪 followed by 7+ hex chars anywhere
 SHA_LABEL_PATTERN = re.compile(r"^🎪 .*[a-f0-9]{7,}.*$")
@@ -24,16 +24,24 @@ def is_sha_label(label: str) -> bool:
 
 
 def is_showtime_comment(body: str) -> bool:
-    """Check if a PR comment body was authored by Showtime.
+    """Check if a PR comment body matches the shape of a Showtime comment.
 
-    New comments carry an invisible HTML marker. Comments posted by older
-    Showtime versions are recognized by their distinctive header instead.
+    This is a content heuristic only, not an authorship check — a quote-reply
+    or a comment discussing Showtime can still match. Callers that delete
+    comments must additionally gate on `comment["user"]["login"]`.
+
+    New comments carry an invisible HTML marker as their last line. Comments
+    posted by older Showtime versions are recognized by their distinctive
+    header instead.
     """
-    if SHOWTIME_COMMENT_MARKER in body:
+    # Anchored to the last line: the producer always appends the marker as
+    # the final line, so a quote-reply (which appends text after it) won't
+    # match even though it copies the marker into the quoted body.
+    if body.rstrip().endswith(SHOWTIME_COMMENT_MARKER):
         return True
-    # Legacy comments (posted before the marker existed): they all start with
-    # the circus tent emoji and link to the superset-showtime repository
-    return body.startswith("🎪") and "superset-showtime" in body
+    # Legacy comments (posted before the marker existed) all start with this
+    # exact header, unlike a human comment that merely mentions the repo.
+    return body.startswith(LEGACY_COMMENT_PREFIX)
 
 
 # Constants
@@ -60,6 +68,7 @@ class GitHubInterface:
         self.org = org or os.getenv("GITHUB_ORG", "apache")
         self.repo = repo or os.getenv("GITHUB_REPO", "superset")
         self.base_url = "https://api.github.com"
+        self._authenticated_login: Optional[str] = None
 
         if not self.token:
             raise GitHubError("GitHub token required. Set GITHUB_TOKEN environment variable.")
@@ -88,6 +97,24 @@ class GitHubInterface:
     def get_current_actor() -> str:
         """Get current GitHub actor with consistent fallback across the codebase"""
         return os.getenv("GITHUB_ACTOR", DEFAULT_GITHUB_ACTOR)
+
+    def get_authenticated_login(self) -> str:
+        """Get the login this token authenticates as, cached per instance.
+
+        `GET /user` 403s for the default `secrets.GITHUB_TOKEN` (Actions
+        tokens can't call the user endpoint) — that's the expected case in
+        CI, so it falls back to the actions bot identity rather than raising.
+        """
+        if self._authenticated_login is None:
+            url = f"{self.base_url}/user"
+            with httpx.Client() as client:
+                response = client.get(url, headers=self.headers)
+                if response.status_code == 403:
+                    self._authenticated_login = "github-actions[bot]"
+                else:
+                    response.raise_for_status()
+                    self._authenticated_login = str(response.json()["login"])
+        return self._authenticated_login
 
     @staticmethod
     def get_actor_debug_info() -> dict:
@@ -271,40 +298,71 @@ class GitHubInterface:
         )
         return [issue["number"] for issue in items]
 
-    def post_comment(self, pr_number: int, body: str) -> None:
-        """Post a comment on a PR"""
+    def post_comment(self, pr_number: int, body: str) -> Dict[str, Any]:
+        """Post a comment on a PR
+
+        Returns:
+            The created comment (includes its id)
+        """
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/comments"
 
         with httpx.Client() as client:
             response = client.post(url, headers=self.headers, json={"body": body})
             response.raise_for_status()
+            return dict(response.json())
 
     def get_comments(self, pr_number: int) -> List[Dict[str, Any]]:
         """Get all issue comments on a PR (paginated)"""
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/{pr_number}/comments"
         return self._paginate(url)
 
-    def delete_comment(self, comment_id: int) -> None:
-        """Delete a PR comment by id"""
+    def delete_comment(self, comment_id: int) -> bool:
+        """Delete a PR comment by id
+
+        Returns:
+            True if the comment was deleted, False if it was already gone (404)
+        """
         url = f"{self.base_url}/repos/{self.org}/{self.repo}/issues/comments/{comment_id}"
 
         with httpx.Client() as client:
             response = client.delete(url, headers=self.headers)
-            # 404 is OK - comment might already be gone
-            if response.status_code not in (204, 404):
+            if response.status_code == 204:
+                return True
+            elif response.status_code == 404:
+                return False  # Comment might already be gone
+            else:
                 response.raise_for_status()
+                return False  # Should never reach here
 
-    def delete_showtime_comments(self, pr_number: int) -> int:
-        """Delete all previous Showtime comments on a PR
+    def delete_showtime_comments(self, pr_number: int, except_id: Optional[int] = None) -> int:
+        """Delete previous Showtime comments authored by this token's own identity
+
+        Comment bodies are attacker-controlled on a public PR, so
+        `is_showtime_comment` alone is not a safe basis for an irreversible
+        delete — every candidate must also be authored by this token's own
+        login before it's removed.
+
+        Args:
+            pr_number: PR to clean up
+            except_id: Comment id to preserve, e.g. one just posted
 
         Returns:
-            Number of comments deleted
+            Number of comments actually deleted
         """
+        me = self.get_authenticated_login()
         deleted = 0
         for comment in self.get_comments(pr_number):
-            if is_showtime_comment(comment.get("body") or ""):
-                self.delete_comment(comment["id"])
-                deleted += 1
+            if comment["id"] == except_id:
+                continue
+            if (comment.get("user") or {}).get("login") != me:
+                continue
+            if not is_showtime_comment(comment.get("body") or ""):
+                continue
+            try:
+                if self.delete_comment(comment["id"]):
+                    deleted += 1
+            except Exception as e:
+                print(f"⚠️ Could not delete comment {comment['id']}: {e}")
         return deleted
 
     def validate_connection(self) -> bool:

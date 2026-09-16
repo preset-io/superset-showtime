@@ -601,6 +601,199 @@ def test_pullrequest_sync_destroy_environment(mock_get_github: Mock) -> None:
 
 
 @patch("showtime.core.pull_request.get_github")
+def test_pullrequest_sync_destroy_environment_failure_skips_cleanup_comment(
+    mock_get_github: Mock,
+) -> None:
+    """A failed AWS teardown must not post a 'no further charges' comment over
+    a still-live, still-billing environment"""
+    mock_github = Mock()
+    mock_get_github.return_value = mock_github
+
+    mock_github.get_labels.return_value = [
+        "🎪 🛑 showtime-trigger-stop",
+        "🎪 abc123f 🚦 running",
+        "🎪 🎯 abc123f",
+    ]
+
+    pr = PullRequest(
+        1234, ["🎪 🛑 showtime-trigger-stop", "🎪 abc123f 🚦 running", "🎪 🎯 abc123f"]
+    )
+
+    with patch.object(pr, "_atomic_claim", return_value=True):
+        with patch("showtime.core.show.Show.stop", return_value=False):
+            with patch.object(pr, "_post_cleanup_comment") as mock_cleanup:
+                result = pr.sync("abc123f", dry_run_github=True, dry_run_aws=True)
+
+                assert result.success is True
+                assert result.action_taken == "destroy_environment"
+                mock_cleanup.assert_not_called()
+
+
+@patch("showtime.core.pull_request.get_github")
+def test_pullrequest_sync_create_environment_failure_posts_failure_comment(
+    mock_get_github: Mock,
+) -> None:
+    """A build/deploy exception during create_environment must set status
+    failed and post a failure comment (the sync() except block previously
+    had a bare `# TODO: Post failure comment`)"""
+    mock_github = Mock()
+    mock_get_github.return_value = mock_github
+    mock_github.get_labels.return_value = ["🎪 ⚡ showtime-trigger-start"]
+
+    pr = PullRequest(1234, ["🎪 ⚡ showtime-trigger-start"])
+
+    with patch.object(pr, "_atomic_claim", return_value=True):
+        with patch.object(pr, "_create_new_show") as mock_create:
+            with patch.object(pr, "_post_building_comment"):
+                with patch.object(pr, "_update_show_labels"):
+                    with patch.object(pr, "_post_showtime_comment") as mock_post:
+                        mock_show = Show(pr_number=1234, sha="abc123f", status="building")
+                        mock_create.return_value = mock_show
+                        mock_show.build_docker = Mock(  # type: ignore[method-assign]
+                            side_effect=Exception("docker build failed")
+                        )
+
+                        result = pr.sync(
+                            "abc123f", dry_run_github=True, dry_run_aws=True, dry_run_docker=True
+                        )
+
+                        assert result.success is False
+                        assert result.action_taken == "failed"
+                        assert mock_show.status == "failed"
+                        mock_post.assert_called_once()
+                        assert "docker build failed" in mock_post.call_args.args[0]
+
+
+@patch("showtime.core.pull_request.get_github")
+def test_pullrequest_sync_rolling_update_failure_posts_rolling_failure_comment(
+    mock_get_github: Mock,
+) -> None:
+    """A build/deploy exception on the rolling_update/auto_sync path must set
+    the new show failed and post a rolling-failure comment referencing the
+    still-active old environment"""
+    mock_github = Mock()
+    mock_get_github.return_value = mock_github
+    mock_github.get_labels.return_value = [
+        "🎪 abc123f 🚦 running",
+        "🎪 🎯 abc123f",
+    ]
+
+    pr = PullRequest(1234, ["🎪 abc123f 🚦 running", "🎪 🎯 abc123f"])
+
+    with patch.object(pr, "_determine_action", return_value="rolling_update"):
+        with patch.object(pr, "_atomic_claim", return_value=True):
+            with patch.object(pr, "_create_new_show") as mock_create:
+                with patch.object(pr, "_post_rolling_start_comment"):
+                    with patch.object(pr, "_update_show_labels"):
+                        with patch.object(pr, "_post_showtime_comment") as mock_post:
+                            mock_new_show = Show(
+                                pr_number=1234, sha="def456a", status="building"
+                            )
+                            mock_create.return_value = mock_new_show
+                            mock_new_show.build_docker = Mock(  # type: ignore[method-assign]
+                                side_effect=Exception("rolling deploy failed")
+                            )
+
+                            result = pr.sync(
+                                "def456a",
+                                dry_run_github=True,
+                                dry_run_aws=True,
+                                dry_run_docker=True,
+                            )
+
+                            assert result.success is False
+                            assert mock_new_show.status == "failed"
+                            mock_post.assert_called_once()
+                            assert "rolling deploy failed" in mock_post.call_args.args[0]
+
+
+@patch("showtime.core.pull_request.get_github")
+def test_pullrequest_sync_create_environment_success_comment_failure_not_treated_as_deploy_failure(
+    mock_get_github: Mock,
+) -> None:
+    """A transient error posting the *success* comment (after deploy already
+    succeeded) must not flip a running environment to status=failed or post
+    a misleading failure comment over it"""
+    mock_github = Mock()
+    mock_get_github.return_value = mock_github
+    mock_github.get_labels.return_value = ["🎪 ⚡ showtime-trigger-start"]
+
+    pr = PullRequest(1234, ["🎪 ⚡ showtime-trigger-start"])
+
+    with patch.object(pr, "_atomic_claim", return_value=True):
+        with patch.object(pr, "_create_new_show") as mock_create:
+            with patch.object(pr, "_post_building_comment"):
+                with patch.object(pr, "_update_show_labels"):
+                    with patch.object(pr, "_post_showtime_comment") as mock_post:
+                        with patch.object(
+                            pr,
+                            "_post_success_comment",
+                            side_effect=Exception("comment post failed"),
+                        ):
+                            mock_show = Show(pr_number=1234, sha="abc123f", status="building")
+                            mock_create.return_value = mock_show
+                            mock_show.build_docker = Mock()  # type: ignore[method-assign]
+                            mock_show.deploy_aws = Mock()  # type: ignore[method-assign]
+
+                            result = pr.sync(
+                                "abc123f",
+                                dry_run_github=True,
+                                dry_run_aws=True,
+                                dry_run_docker=True,
+                            )
+
+                            assert result.success is True
+                            assert result.action_taken == "create_environment"
+                            assert mock_show.status == "running"
+                            mock_post.assert_not_called()
+
+
+@patch("showtime.core.pull_request.get_github")
+def test_pullrequest_sync_rolling_update_success_comment_failure_not_treated_as_deploy_failure(
+    mock_get_github: Mock,
+) -> None:
+    """Same guarantee as above, on the rolling_update/auto_sync path"""
+    mock_github = Mock()
+    mock_get_github.return_value = mock_github
+    mock_github.get_labels.return_value = [
+        "🎪 abc123f 🚦 running",
+        "🎪 🎯 abc123f",
+    ]
+
+    pr = PullRequest(1234, ["🎪 abc123f 🚦 running", "🎪 🎯 abc123f"])
+
+    with patch.object(pr, "_determine_action", return_value="rolling_update"):
+        with patch.object(pr, "_atomic_claim", return_value=True):
+            with patch.object(pr, "_create_new_show") as mock_create:
+                with patch.object(pr, "_post_rolling_start_comment"):
+                    with patch.object(pr, "_update_show_labels"):
+                        with patch.object(pr, "_post_showtime_comment") as mock_post:
+                            with patch.object(
+                                pr,
+                                "_post_rolling_success_comment",
+                                side_effect=Exception("comment post failed"),
+                            ):
+                                mock_new_show = Show(
+                                    pr_number=1234, sha="def456a", status="building"
+                                )
+                                mock_create.return_value = mock_new_show
+                                mock_new_show.build_docker = Mock()  # type: ignore[method-assign]
+                                mock_new_show.deploy_aws = Mock()  # type: ignore[method-assign]
+
+                                result = pr.sync(
+                                    "def456a",
+                                    dry_run_github=True,
+                                    dry_run_aws=True,
+                                    dry_run_docker=True,
+                                )
+
+                                assert result.success is True
+                                assert result.action_taken == "rolling_update"
+                                assert mock_new_show.status == "running"
+                                mock_post.assert_not_called()
+
+
+@patch("showtime.core.pull_request.get_github")
 def test_pullrequest_sync_claim_failed(mock_get_github: Mock) -> None:
     """Test sync method when atomic claim fails"""
     mock_github = Mock()

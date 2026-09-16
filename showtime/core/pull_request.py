@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
+from .constants import SHOWTIME_COMMENT_MARKER
 from .github import GitHubInterface, is_sha_label
 from .show import Show, short_sha
 from .sync_state import ActionNeeded, AuthStatus, BlockedReason, SyncState
@@ -610,7 +611,12 @@ class PullRequest:
                 # Show AWS console URLs for monitoring
                 self._show_service_urls(show)
 
-                self._post_success_comment(show, dry_run_github)
+                try:
+                    self._post_success_comment(show, dry_run_github)
+                except Exception as post_error:
+                    # Deploy already succeeded - a comment-posting failure
+                    # here must not be treated as a deploy failure.
+                    print(f"⚠️ Failed to post success comment: {post_error}")
                 return SyncResult(success=True, action_taken="create_environment", show=show)
 
             elif action_needed in ["rolling_update", "auto_sync"]:
@@ -647,7 +653,12 @@ class PullRequest:
                 # Show AWS console URLs for monitoring
                 self._show_service_urls(new_show)
 
-                self._post_rolling_success_comment(old_show, new_show, dry_run_github)
+                try:
+                    self._post_rolling_success_comment(old_show, new_show, dry_run_github)
+                except Exception as post_error:
+                    # Deploy already succeeded - a comment-posting failure
+                    # here must not be treated as a deploy failure.
+                    print(f"⚠️ Failed to post success comment: {post_error}")
                 return SyncResult(success=True, action_taken=action_needed, show=new_show)
 
             elif action_needed == "destroy_environment":
@@ -659,9 +670,15 @@ class PullRequest:
                     )
                     if success:
                         print("☁️ AWS resources deleted")
+                        self._post_cleanup_comment(self.current_show, dry_run_github)
                     else:
-                        print("⚠️ AWS resource deletion may have failed")
-                    self._post_cleanup_comment(self.current_show, dry_run_github)
+                        # Don't post a "cleaned up, no further charges" comment
+                        # over a live, still-billing environment - leave the
+                        # existing deployed comment (with its URL) in place.
+                        print(
+                            "⚠️ AWS resource deletion may have failed - "
+                            "leaving existing comment in place"
+                        )
                 else:
                     print("🗑️ No current environment to destroy")
 
@@ -687,11 +704,33 @@ class PullRequest:
                 return SyncResult(success=True, action_taken="no_action")
 
         except Exception as e:
-            # Transaction failed - set failed state and update labels
-            if "show" in locals():
+            # Transaction failed - set failed state, update labels, and post
+            # a failure comment so the last comment on the PR reflects
+            # reality (the prior deployed/updating comment may already be
+            # gone - _post_showtime_comment cleans up on every post).
+            from .github_messages import failure_comment, rolling_failure_comment
+
+            if action_needed == "create_environment" and "show" in locals():
                 show.status = "failed"
                 self._update_show_labels(show, dry_run_github)
-                # TODO: Post failure comment
+                try:
+                    self._post_showtime_comment(failure_comment(show, str(e)), dry_run_github)
+                except Exception as post_error:
+                    print(f"⚠️ Failed to post failure comment: {post_error}")
+            elif (
+                action_needed in ("rolling_update", "auto_sync")
+                and "new_show" in locals()
+                and "old_show" in locals()
+            ):
+                new_show.status = "failed"
+                self._update_show_labels(new_show, dry_run_github)
+                full_sha = new_show.sha + "0" * (40 - len(new_show.sha))
+                try:
+                    self._post_showtime_comment(
+                        rolling_failure_comment(old_show, full_sha, str(e)), dry_run_github
+                    )
+                except Exception as post_error:
+                    print(f"⚠️ Failed to post failure comment: {post_error}")
             return SyncResult(success=False, action_taken="failed", error=str(e))
 
     def start_environment(self, sha: Optional[str] = None, **kwargs: Any) -> SyncResult:
@@ -1022,26 +1061,26 @@ class PullRequest:
         )
 
     def _post_showtime_comment(self, comment: str, dry_run: bool = False) -> None:
-        """Post a Showtime comment, deleting superseded Showtime comments first
+        """Post a Showtime comment, then delete superseded Showtime comments
 
         Each new lifecycle comment replaces the previous ones so PR threads
-        don't accumulate stale building/deployed/updating messages. Cleanup
-        failures are non-fatal - worst case the old comments stick around.
+        don't accumulate stale building/deployed/updating messages. Posting
+        first (and excluding the new comment from the sweep) means a failed
+        cleanup never costs the new comment, and a failed post never costs
+        the old ones - worst case the old comments stick around.
         """
-        from .constants import SHOWTIME_COMMENT_MARKER
-
         if dry_run:
             return
 
         github = get_github()
+        posted = github.post_comment(self.pr_number, f"{comment}\n\n{SHOWTIME_COMMENT_MARKER}")
+
         try:
-            deleted = github.delete_showtime_comments(self.pr_number)
+            deleted = github.delete_showtime_comments(self.pr_number, except_id=posted["id"])
             if deleted:
                 print(f"🧹 Removed {deleted} superseded Showtime comment(s)")
         except Exception as e:
             print(f"⚠️ Failed to clean up old Showtime comments: {e}")
-
-        github.post_comment(self.pr_number, f"{comment}\n\n{SHOWTIME_COMMENT_MARKER}")
 
     def _post_building_comment(self, show: Show, dry_run: bool = False) -> None:
         """Post building comment for new environment"""
