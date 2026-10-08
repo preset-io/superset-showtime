@@ -3,7 +3,7 @@
 **Modern ephemeral environment management for Apache Superset using circus tent emoji labels**
 
 [![PyPI version](https://badge.fury.io/py/superset-showtime.svg)](https://badge.fury.io/py/superset-showtime)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 ## 🎯 What is Showtime?
 
