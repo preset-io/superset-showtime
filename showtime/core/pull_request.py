@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .aws import AWSInterface
+from .constants import SHOWTIME_COMMENT_MARKER
 from .github import GitHubInterface
 from .readiness import DEFAULT_STARTUP_TIMEOUT_SECONDS, validate_startup_timeout_seconds
 from .runner_smoke import (
@@ -852,7 +853,26 @@ class PullRequest:
                     show=candidate,
                     error=f"Environment remains promoted; a later operation failed: {exc}",
                 )
-            return self._record_failed_candidate(candidate, exc, dry_run_github, dry_run_aws)
+            result = self._record_failed_candidate(candidate, exc, dry_run_github, dry_run_aws)
+
+            # Post a failure comment so the last comment on the PR reflects
+            # reality (the prior deployed/updating comment may already be
+            # gone - _post_showtime_comment cleans up on every post).
+            from .github_messages import failure_comment, rolling_failure_comment
+
+            try:
+                if previous_running:
+                    self._post_showtime_comment(
+                        rolling_failure_comment(previous_running[0], candidate.sha, str(exc)),
+                        dry_run_github,
+                    )
+                else:
+                    self._post_showtime_comment(
+                        failure_comment(candidate, str(exc)), dry_run_github
+                    )
+            except Exception as post_error:
+                print(f"⚠️ Failed to post failure comment: {post_error}")
+            return result
 
     def start_environment(self, sha: Optional[str] = None, **kwargs: Any) -> SyncResult:
         """Start a new environment (CLI start command logic)"""
@@ -1171,52 +1191,46 @@ class PullRequest:
             cleanup_pending=pending is not None,
         )
 
+    def _post_showtime_comment(self, comment: str, dry_run: bool = False) -> None:
+        """Post a Showtime comment, then delete superseded Showtime comments
+
+        Each new lifecycle comment replaces the previous ones so PR threads
+        don't accumulate stale building/deployed/updating messages. Posting
+        first (and excluding the new comment from the sweep) means a failed
+        cleanup never costs the new comment, and a failed post never costs
+        the old ones - worst case the old comments stick around.
+        """
+        if dry_run:
+            return
+
+        github = get_github()
+        posted = github.post_comment(self.pr_number, f"{comment}\n\n{SHOWTIME_COMMENT_MARKER}")
+
+        try:
+            deleted = github.delete_showtime_comments(self.pr_number, except_id=posted["id"])
+            if deleted:
+                print(f"🧹 Removed {deleted} superseded Showtime comment(s)")
+        except Exception as e:
+            print(f"⚠️ Failed to clean up old Showtime comments: {e}")
+
     def _post_building_comment(self, show: Show, dry_run: bool = False) -> None:
         """Post building comment for new environment"""
         from .github_messages import building_comment
 
-        if not dry_run:
-            comment = building_comment(show)
-            get_github().post_comment(self.pr_number, comment)
+        self._post_showtime_comment(building_comment(show), dry_run)
 
     def _post_success_comment(self, show: Show, dry_run: bool = False) -> None:
         """Post success comment for completed environment"""
         from .github_messages import success_comment
 
-        if not dry_run:
-            effective_ttl = self._get_effective_ttl_display()
-            comment = success_comment(show, ttl=effective_ttl)
-            get_github().post_comment(self.pr_number, comment)
-
-    def _post_rolling_start_comment(
-        self, old_show: Show, new_show: Show, dry_run: bool = False
-    ) -> None:
-        """Post rolling update start comment"""
-        from .github_messages import rolling_start_comment
-
-        if not dry_run:
-            full_sha = new_show.sha + "0" * (40 - len(new_show.sha))
-            comment = rolling_start_comment(old_show, full_sha)
-            get_github().post_comment(self.pr_number, comment)
-
-    def _post_rolling_success_comment(
-        self, old_show: Show, new_show: Show, dry_run: bool = False
-    ) -> None:
-        """Post rolling update success comment"""
-        from .github_messages import rolling_success_comment
-
-        if not dry_run:
-            effective_ttl = self._get_effective_ttl_display()
-            comment = rolling_success_comment(old_show, new_show, ttl=effective_ttl)
-            get_github().post_comment(self.pr_number, comment)
+        effective_ttl = self._get_effective_ttl_display()
+        self._post_showtime_comment(success_comment(show, ttl=effective_ttl), dry_run)
 
     def _post_cleanup_comment(self, show: Show, dry_run: bool = False) -> None:
         """Post cleanup completion comment"""
         from .github_messages import cleanup_comment
 
-        if not dry_run:
-            comment = cleanup_comment(show)
-            get_github().post_comment(self.pr_number, comment)
+        self._post_showtime_comment(cleanup_comment(show), dry_run)
 
     def stop_if_expired(self, max_age_hours: int, dry_run: bool = False) -> bool:
         """Stop environment if it's expired based on age
