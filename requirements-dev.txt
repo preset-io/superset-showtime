@@ -36,7 +36,7 @@ distlib==0.4.0
     # via virtualenv
 docutils==0.22
     # via readme-renderer
-filelock==3.32.7
+filelock==4.1.0
     # via virtualenv
 gitdb==4.0.12
     # via gitpython
